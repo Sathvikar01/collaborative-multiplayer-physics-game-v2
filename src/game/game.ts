@@ -1,12 +1,20 @@
 import * as THREE from "three";
 import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeometry.js";
 import type RAPIER_T from "@dimforge/rapier3d-compat";
-import { RagdollBody, PARTS, PART_COUNT, PELVIS, HEAD, CHEST, GROUP_ENV, GROUP_PROP, groups, findStaticGrab, type BodyEvent, type GrabTarget } from "./body";
+import { RagdollBody, PARTS, PART_COUNT, PELVIS, HEAD, CHEST, GROUP_ENV, GROUP_PROP, groups, findStaticGrab, type BodyEvent, type BodyInputs, type GrabTarget } from "./body";
 import { getLevel, type LevelDef, type PropDef, type ZoneDef } from "./levels";
 import { GameAudio } from "./audio";
 import type { Role, RoleInput, SquadSize } from "./types";
 import { makeSquadMixState, resolvePhysInputs, type SquadMixState } from "./squad";
 import { RemoteInputBuffer, normalizeRemoteInputs } from "./remoteInput";
+import {
+  CommentaryDirector,
+  isCommentaryCue,
+  isCommentarySnapshot,
+  type CommentaryCue,
+  type CommentaryEvent,
+  type CommentarySnapshot,
+} from "./commentary";
 import {
   PhysicsReactor,
   isPhysicsReactorSnapshot,
@@ -25,6 +33,14 @@ async function loadRapier(): Promise<R> {
   await R.init();
   RAPIER = R;
   return R;
+}
+
+interface LevelEvent {
+  type: string;
+  pos: [number, number, number];
+  force?: number;
+  source?: "body" | "prop";
+  propId?: number;
 }
 
 export interface Snap {
@@ -46,8 +62,10 @@ export interface Snap {
   timer: number;
   fallen: number;
   score: number;
-  ev: (BodyEvent | { type: string; pos: [number, number, number] })[];
+  ev: (BodyEvent | LevelEvent)[];
   msg?: string;
+  commentary?: CommentaryCue;
+  commentaryState?: CommentarySnapshot;
   /** Versioned active-ragdoll/controller state used during host takeover. */
   reactor?: PhysicsReactorSnapshot;
 }
@@ -70,7 +88,12 @@ export interface HudState {
   fallReason: string | null;
 }
 
-export type GameEvent = { type: "finish"; timeMs: number } | { type: "message"; text: string; tone?: "good" | "bad" | "info" } | { type: "hud"; hud: HudState } | { type: "shout"; teamId: number };
+export type GameEvent =
+  | { type: "finish"; timeMs: number }
+  | { type: "message"; text: string; tone?: "good" | "bad" | "info" }
+  | { type: "commentary"; cue: CommentaryCue }
+  | { type: "hud"; hud: HudState }
+  | { type: "shout"; teamId: number };
 
 export interface GameOptions {
   canvas: HTMLCanvasElement;
@@ -97,6 +120,10 @@ const tmpV = new THREE.Vector3();
 const tmpV2 = new THREE.Vector3();
 const tmpQ = new THREE.Quaternion();
 const tmpQ2 = new THREE.Quaternion();
+export const GUEST_INTERPOLATION_DELAY_MS = 90;
+export const GUEST_MAX_EXTRAPOLATION_MS = 130;
+const COMMENTARY_BROADCAST_TICKS = 60;
+const COMMENTARY_LEVEL_EVENTS = new Set(["checkpoint", "score", "finish", "splash", "crack"]);
 
 function lerpAngle(a: number, b: number, t: number) {
   let d = b - a;
@@ -112,12 +139,14 @@ class BodyView {
   pupils: THREE.Mesh[] = [];
   eyes: THREE.Mesh[] = [];
   mouth: THREE.Mesh = new THREE.Mesh();
+  beak: THREE.Mesh = new THREE.Mesh();
   hands: THREE.Mesh[] = [];
   materials: THREE.MeshStandardMaterial[] = [];
   label: THREE.Sprite | null = null;
   bubble: THREE.Sprite | null = null;
   bubbleT = 0;
   blinkT = 2;
+  quackT = 0;
 
   constructor(color: string, public ghost: boolean, teamName: string) {
     const mat = (c: string, extra: Partial<THREE.MeshStandardMaterialParameters> = {}) => {
@@ -136,6 +165,7 @@ class BodyView {
     const dark = mat("#2b2d42");
     const white = mat("#ffffff", { roughness: 0.5 });
     const shoe = mat("#f5f5f5", { roughness: 0.6 });
+    const beakMat = mat("#ff9a3c", { roughness: 0.62 });
 
     for (let i = 0; i < PART_COUNT; i++) {
       const spec = PARTS[i];
@@ -178,9 +208,14 @@ class BodyView {
           this.pupils.push(pupil);
         }
         this.mouth = new THREE.Mesh(new THREE.TorusGeometry(0.055, 0.012, 8, 14, Math.PI), dark);
-        this.mouth.position.set(0, -0.06, -0.185);
+        this.mouth.position.set(0, -0.14, -0.16);
         this.mouth.rotation.z = Math.PI;
         g.add(this.mouth);
+        this.beak = new THREE.Mesh(new THREE.ConeGeometry(0.085, 0.2, 4), beakMat);
+        this.beak.position.set(0, -0.055, -0.22);
+        this.beak.rotation.set(-Math.PI / 2, 0, Math.PI / 4);
+        this.beak.castShadow = !ghost;
+        g.add(this.beak);
         // cap
         const cap = new THREE.Mesh(new THREE.SphereGeometry(0.205, 24, 12, 0, Math.PI * 2, 0, Math.PI * 0.42), team);
         cap.position.y = 0.02;
@@ -235,11 +270,14 @@ class BodyView {
       p.position.y = THREE.MathUtils.lerp(p.position.y, lookPitch * 0.03, 0.2);
     }
     this.blinkT -= dt;
+    this.quackT = Math.max(0, this.quackT - dt);
     const sy = this.blinkT < 0 ? 0.15 : 1;
     if (this.blinkT < -0.12) this.blinkT = 2 + Math.random() * 3;
     for (const e of this.eyes) e.scale.y = THREE.MathUtils.lerp(e.scale.y, fallen ? 0.35 : sy, 0.5);
     this.mouth.scale.setScalar(fallen ? 0.6 : holding ? 1.3 : 1);
     this.mouth.rotation.z = fallen ? 0 : Math.PI;
+    const quack = this.quackT > 0 ? Math.sin((this.quackT / 0.38) * Math.PI * 4) : 0;
+    this.beak.rotation.x = -Math.PI / 2 + Math.max(0, quack) * 0.22;
     if (this.bubble) {
       this.bubbleT -= dt;
       this.bubble.visible = this.bubbleT > 0;
@@ -256,6 +294,7 @@ class BodyView {
     this.bubble.position.set(0.35, 0.95, 0);
     this.bubble.scale.set(1.6, 0.5, 1);
     this.bubbleT = 1.4;
+    this.quackT = 0.38;
     this.parts[HEAD].add(this.bubble);
   }
 
@@ -450,6 +489,7 @@ type RigidBodyT = RAPIER_T.RigidBody;
 interface TeamGhost {
   view: BodyView;
   buffer: { recv: number; snap: Snap }[];
+  transforms: number[];
   lastEvT: number;
 }
 
@@ -509,6 +549,12 @@ export class Game {
   sendAcc = 0;
   pendingEvents: Snap["ev"] = [];
   pendingMsg: string | undefined;
+  private readonly commentary = new CommentaryDirector();
+  private activeCommentary: CommentaryCue | null = null;
+  private commentaryBroadcastUntilTick = -1;
+  private lastReceivedCommentaryId: string | null = null;
+  private commentaryStartEvent: "start" | "retry" | null = null;
+  private commentaryRunCount = 0;
   hudAcc = 0;
   disposed = false;
   displayYaw = 0;
@@ -747,6 +793,8 @@ export class Game {
     this.timer = 0;
     this.running = false;
     this.finished = false;
+    this.commentaryRunCount = 0;
+    this.resetCommentary();
 
     const L = this.level;
     // per-level sky + water tint (falls back to day blue)
@@ -1092,7 +1140,15 @@ export class Game {
       m.rb.setLinvel({ x: 0, y: 0, z: 0 }, true);
       m.mesh.position.set(x, m.base.y, z);
     }
-    if (s.reactor) this.reactor?.restore(s.reactor);
+    const reactorRestored = s.reactor ? this.reactor?.restore(s.reactor) === true : false;
+    const commentaryRestored = reactorRestored
+      && !!s.commentaryState
+      && s.commentaryState.lastTick === this.reactor?.currentTick
+      && this.commentary.restore(s.commentaryState);
+    if (!commentaryRestored) this.commentary.reset();
+    this.activeCommentary = commentaryRestored ? s.commentary ?? null : null;
+    this.commentaryBroadcastUntilTick = commentaryRestored && s.commentary ? s.commentary.tick + COMMENTARY_BROADCAST_TICKS : -1;
+    this.lastReceivedCommentaryId = commentaryRestored ? s.commentary?.id ?? null : null;
   }
 
   private findGrab(hp: THREE.Vector3, exclude: number[]): GrabTarget | null {
@@ -1141,6 +1197,14 @@ export class Game {
   }
 
   /* ------------------------------- Flow ------------------------------- */
+  private resetCommentary(preservePhrases = false) {
+    this.commentary.reset({ preservePhrases });
+    this.activeCommentary = null;
+    this.commentaryBroadcastUntilTick = -1;
+    this.lastReceivedCommentaryId = null;
+    this.commentaryStartEvent = null;
+  }
+
   prepareRun() {
     // teleport to spawn, freeze, reset props and state
     this.ownBuffer = [];
@@ -1154,6 +1218,7 @@ export class Game {
     this.denyCooldown = 0;
     this.moverT = 0;
     this.squadMix = makeSquadMixState();
+    this.resetCommentary(true);
     for (const f of this.checkpointMeshes) (f.material as THREE.MeshStandardMaterial).color.set("#ffd23f");
     if (this.isHost) {
       for (const m of this.movers) {
@@ -1177,6 +1242,8 @@ export class Game {
     this.frozen = false;
     if (this.body) this.body.frozen = false;
     this.running = true;
+    this.commentaryStartEvent = this.commentaryRunCount > 0 ? "retry" : "start";
+    this.commentaryRunCount++;
     this.timer = 0;
     this.emitHud();
   }
@@ -1184,6 +1251,7 @@ export class Game {
     this.frozen = false;
     this.running = false;
     this.finished = false;
+    this.resetCommentary(true);
     if (this.body) this.body.frozen = false;
     this.emitHud();
   }
@@ -1231,14 +1299,15 @@ export class Game {
 
   private frame(dt: number) {
     if (this.isHost && this.body) {
-      // Merge squad input without collapsing the two hand players into one
-      // channel. The reactor owns all fixed substeps from this point onward.
-      // Expired remote leases become neutral input before they reach the mixer.
+      // Merge the universal crew controls into locomotion and two independent
+      // hand channels. Expired remote leases become neutral before mixing.
       const merged: Partial<Record<Role, RoleInput>> = { ...this.remoteInputBuffer.getMerged(), ...this.localInputs };
+      this.squadMix.heading = this.body.heading;
+      this.squadMix.legT = this.body.time;
       const phys = resolvePhysInputs(merged, this.squadSize, Math.min(dt, 0.1), this.squadMix);
       const reactorFrame = this.reactor?.advance(dt, phys, {
         beforeStep: ({ dt: stepDt }) => this.beforePhysicsStep(stepDt),
-        afterStep: ({ dt: stepDt }, stepResult) => this.afterPhysicsStep(stepDt, stepResult),
+        afterStep: ({ dt: stepDt }, stepResult) => this.afterPhysicsStep(stepDt, stepResult, merged, phys),
       });
       this.physicsDiagnostics = reactorFrame?.diagnostics ?? null;
       this.body.writeTransforms(this.displayTransforms);
@@ -1279,7 +1348,7 @@ export class Game {
     this.view.setFace(dt, this.displayYaw, this.displayPitch, this.pelvisYawFromDisplay(), this.displayFallen, this.displayHolding > 0);
     // ghosts
     for (const g of this.ghosts.values()) {
-      const arr: number[] = new Array(PART_COUNT * 7);
+      const arr = g.transforms;
       const ok = this.applyInterpolated(g.buffer, arr, false);
       g.view.root.visible = ok;
       if (ok) {
@@ -1332,11 +1401,67 @@ export class Game {
     this.denyCooldown = Math.max(0, this.denyCooldown - dt);
   }
 
-  private afterPhysicsStep(dt: number, result: ReactorStepResult) {
+  private afterPhysicsStep(
+    dt: number,
+    result: ReactorStepResult,
+    roleInputs: Partial<Record<Role, RoleInput>>,
+    inputs: BodyInputs,
+  ) {
+    const eventStart = this.pendingEvents.length;
     if (this.running && !this.finished) this.timer += dt;
     for (const ev of result.bodyEvents) this.handleBodyEvent(ev, true);
     for (const event of result.contactForceEvents) this.handleContactForceEvent(event);
     this.checkObjectives();
+    this.updateCommentary(result, roleInputs, inputs, this.pendingEvents.slice(eventStart));
+  }
+
+  private updateCommentary(
+    result: ReactorStepResult,
+    roleInputs: Partial<Record<Role, RoleInput>>,
+    inputs: BodyInputs,
+    events: Snap["ev"],
+  ) {
+    if (!this.running && !this.finished && !this.commentaryStartEvent) return;
+    if (this.finished && !events.some((event) => event.type === "finish")) {
+      if (result.tick > this.commentaryBroadcastUntilTick) this.activeCommentary = null;
+      return;
+    }
+    const observedEvents: CommentaryEvent[] = [];
+    if (this.commentaryStartEvent) {
+      observedEvents.push({ type: this.commentaryStartEvent });
+      this.commentaryStartEvent = null;
+    }
+    for (const event of events) {
+      if (isBodyEvent(event)) {
+        observedEvents.push({ type: event.type, reason: event.reason, hand: event.hand, propId: event.propId });
+      } else if (COMMENTARY_LEVEL_EVENTS.has(event.type)) {
+        observedEvents.push({
+          type: event.type as "checkpoint" | "score" | "finish" | "splash" | "crack",
+          source: event.source,
+          propId: event.propId,
+        });
+      }
+    }
+    const cue = this.commentary.step({
+      tick: result.tick,
+      challengeId: this.level.id,
+      diagnostics: { ...result.diagnostics, hanging: this.body?.holds.some((hold) => hold.isStatic) ?? false },
+      events: observedEvents,
+      inputs,
+      roleInputs,
+      objective: {
+        running: this.running,
+        finished: this.finished,
+        checkpoint: this.checkpointIdx,
+        score: this.score,
+        scoreTarget: this.level.targetScore ?? 0,
+      },
+    });
+    if (result.tick > this.commentaryBroadcastUntilTick) this.activeCommentary = null;
+    if (!cue) return;
+    this.activeCommentary = cue;
+    this.commentaryBroadcastUntilTick = cue.tick + COMMENTARY_BROADCAST_TICKS;
+    this.onEvent({ type: "commentary", cue });
   }
 
   private handleContactForceEvent(ev: ReactorContactForceEvent) {
@@ -1370,7 +1495,6 @@ export class Game {
     this.handleLevelEvent({ type: "crack", pos: [t.x, t.y, t.z] }, true);
     if (this.body) for (const h of [...this.body.holds]) if (h.id === p.id) this.body.releaseAll(true);
     this.resetProp(p);
-    this.message("The egg cracked! It respawned at the start.", "bad");
   }
 
   private checkObjectives() {
@@ -1381,19 +1505,17 @@ export class Game {
     if (pp.y < L.killY) {
       const cp = L.checkpoints[this.checkpointIdx];
       const spawn = cp?.spawn ? new THREE.Vector3(...cp.spawn) : new THREE.Vector3(...L.spawn);
-      this.handleLevelEvent({ type: "splash", pos: [pp.x, -3, pp.z] }, true);
+      this.handleLevelEvent({ type: "splash", pos: [pp.x, -3, pp.z], source: "body" }, true);
       body.teleport(spawn, L.spawnYaw);
       this.reactor?.resetClock();
-      this.message("SPLASH! Back to the last checkpoint.", "bad");
     }
     for (const p of this.props) {
       if (!p.body) continue;
       const t = p.body.translation();
       if (t.y < L.killY) {
-        this.handleLevelEvent({ type: "splash", pos: [t.x, -3, t.z] }, true);
+        this.handleLevelEvent({ type: "splash", pos: [t.x, -3, t.z], source: "prop", propId: p.id }, true);
         if (body.isHolding(p.id)) body.releaseAll(true);
         this.resetProp(p);
-        if (p.def.deliverable) this.message("The egg fell in the water! Respawned.", "bad");
       }
     }
     if (!this.running || this.finished) return;
@@ -1403,7 +1525,6 @@ export class Game {
         this.checkpointIdx = i;
         (this.checkpointMeshes[i].material as THREE.MeshStandardMaterial).color.set("#6ef29a");
         this.handleLevelEvent({ type: "checkpoint", pos: [pp.x, pp.y, pp.z] }, true);
-        this.message("CHECKPOINT!", "good");
       }
     });
     if (L.deliver) {
@@ -1414,9 +1535,8 @@ export class Game {
         if (inZone(tmpV2.set(t.x, t.y, t.z), L.deliver) && !body.isHolding(p.id) && Math.hypot(v.x, v.y, v.z) < 0.8) {
           if (L.requireDeliverThenFinish && L.finish) {
             if (!this.delivered) {
-              this.delivered = true;
-              this.handleLevelEvent({ type: "score", pos: [t.x, t.y, t.z] }, true);
-              this.message("CORE PLACED! Now sprint the timing gate!", "good");
+                this.delivered = true;
+                this.handleLevelEvent({ type: "score", pos: [t.x, t.y, t.z] }, true);
             }
           } else this.finish();
         }
@@ -1448,7 +1568,6 @@ export class Game {
         if (v.y < -0.5 && inZone(tmpV2.set(t.x, t.y, t.z), L.hoop.zone)) {
           this.score++;
           this.handleLevelEvent({ type: "score", pos: [t.x, t.y, t.z] }, true);
-          this.message(`BASKET! ${this.score} / ${L.targetScore}`, "good");
           p.cooldown = 1.5;
           this.scheduleTimeout(() => this.resetProp(p), 900);
           if (this.score >= (L.targetScore ?? 3)) this.finish();
@@ -1501,6 +1620,7 @@ export class Game {
       case "drop":
         a.fall();
         this.particles.emit(p, 10, { color: ["#ff9a3c", "#ffffff"], speed: 1.5, up: 0.8, size: 0.06, life: 0.45 });
+        this.view.shout("WHOOPS");
         break;
       case "throw":
         a.whoosh();
@@ -1510,6 +1630,7 @@ export class Game {
         a.fall();
         this.particles.emit(p, 16, { color: ["#e8dcc5", "#cfc3a8"], speed: 2.5, up: 1.6, size: 0.08, life: 0.6, spread: 0.6 });
         this.shake = Math.max(this.shake, 0.5);
+        this.view.shout(["TACTICAL NAP", "WHEEEE", "I'M FINE"][Math.floor(Math.random() * 3)]);
         break;
       case "getup":
         a.getup();
@@ -1526,8 +1647,10 @@ export class Game {
         a.climb();
         break;
       case "shout": {
-        a.shout();
-        const words = ["LEFT!", "RIGHT!", "NO NO NO", "LEG!!", "GRAB IT!", "WAIT!", "GO GO GO", "LEAN!", "OTHER LEFT!", "AAAH", "CROUCH!", "JUMP!!", "why", "STOP!", "TOGETHER!"];
+        a.quack();
+        this.particles.emit(p, 9, { color: ["#ff9a3c", "#ffd23f", "#ffffff"], speed: 1.4, up: 1.5, size: 0.055, life: 0.42, spread: 0.22 });
+        this.shake = Math.max(this.shake, 0.07);
+        const words = ["QUACK!", "WAAK!", "HONK??", "GO GO GO", "GRAB IT!", "OTHER LEFT!", "BONK MODE", "why", "TOGETHER-ISH!"];
         this.view.shout(words[Math.floor(Math.random() * words.length)]);
         break;
       }
@@ -1538,13 +1661,14 @@ export class Game {
     }
   }
 
-  handleLevelEvent(ev: { type: string; pos: [number, number, number]; force?: number }, local: boolean) {
+  handleLevelEvent(ev: LevelEvent, local: boolean) {
     const a = this.audio;
     switch (ev.type) {
       case "thud":
         a.thud(ev.force ?? 0.5);
         this.particles.emit(ev.pos, 6, { color: ["#e8dcc5", "#ffffff"], speed: 1.5, up: 1, size: 0.06, life: 0.4 });
         this.shake = Math.max(this.shake, 0.15 * (ev.force ?? 0.5));
+        if ((ev.force ?? 0) > 0.78) this.view.shout("BONK!");
         break;
       case "bounce":
         a.thud((ev.force ?? 0.5) * 0.5);
@@ -1599,6 +1723,11 @@ export class Game {
         av.push(r3(angular.x), r3(angular.y), r3(angular.z));
       }
     }
+    const commentaryState = this.commentary.capture();
+    const commentaryTick = this.reactor?.currentTick ?? commentaryState.lastTick;
+    const commentary = this.activeCommentary && commentaryTick <= this.commentaryBroadcastUntilTick
+      ? this.activeCommentary
+      : undefined;
     return {
       t: performance.now(),
       p: this.displayTransforms.map(r3),
@@ -1618,6 +1747,8 @@ export class Game {
       score: this.score,
       ev: this.pendingEvents,
       msg: this.pendingMsg,
+      commentary,
+      commentaryState,
       // Body transforms/velocities already live in p/v/av. Keep only the
       // compact controller/grip continuation state on the 15 Hz wire path.
       reactor: this.reactor?.capture(false),
@@ -1656,6 +1787,10 @@ export class Game {
       const [tone, ...rest] = s.msg.split("|");
       this.onEvent({ type: "message", text: rest.join("|"), tone: tone as "good" | "bad" | "info" });
     }
+    if (s.commentary && s.commentary.id !== this.lastReceivedCommentaryId) {
+      this.lastReceivedCommentaryId = s.commentary.id;
+      this.onEvent({ type: "commentary", cue: s.commentary });
+    }
     return true;
   }
 
@@ -1666,7 +1801,7 @@ export class Game {
     if (!g) {
       const view = new BodyView(color, true, name);
       this.scene.add(view.root);
-      g = { view, buffer: [], lastEvT: 0 };
+      g = { view, buffer: [], transforms: new Array(PART_COUNT * 7).fill(0), lastEvT: 0 };
       this.ghosts.set(teamId, g);
     }
     g.buffer.push({ recv: performance.now(), snap: s });
@@ -1692,10 +1827,10 @@ export class Game {
 
   private applyInterpolated(buffer: { recv: number; snap: Snap }[], out: number[], withProps: boolean): boolean {
     if (buffer.length === 0) return false;
-    const delay = 110;
-    const rt = performance.now() - delay;
+    const rt = performance.now() - GUEST_INTERPOLATION_DELAY_MS;
     let a = buffer[0];
     let b = buffer[buffer.length - 1];
+    let extrapolating = false;
     for (let i = 0; i < buffer.length - 1; i++) {
       if (buffer[i].recv <= rt && buffer[i + 1].recv >= rt) {
         a = buffer[i];
@@ -1703,9 +1838,23 @@ export class Game {
         break;
       }
     }
-    if (rt > b.recv) a = b;
+    if (rt > b.recv) {
+      const latest = buffer.length - 1;
+      if (latest > 0) {
+        a = buffer[latest - 1];
+        b = buffer[latest];
+        extrapolating = true;
+      } else {
+        a = b;
+      }
+    }
     const span = b.recv - a.recv;
-    const k = span > 0 ? THREE.MathUtils.clamp((rt - a.recv) / span, 0, 1) : 1;
+    // Briefly project the last measured motion when delivery jitters. Large
+    // pelvis jumps are teleports/checkpoints and intentionally snap instead.
+    const pelvisStep = Math.hypot(b.snap.p[0] - a.snap.p[0], b.snap.p[1] - a.snap.p[1], b.snap.p[2] - a.snap.p[2]);
+    const maxK = extrapolating && pelvisStep < 2.5 ? 1 + GUEST_MAX_EXTRAPOLATION_MS / Math.max(span, 1) : 1;
+    const k = span > 0 ? THREE.MathUtils.clamp((rt - a.recv) / span, 0, maxK) : 1;
+    const rotationK = extrapolating ? Math.min(k, 1.5) : k;
     for (let i = 0; i < PART_COUNT; i++) {
       const o = i * 7;
       out[o] = THREE.MathUtils.lerp(a.snap.p[o], b.snap.p[o], k);
@@ -1713,7 +1862,7 @@ export class Game {
       out[o + 2] = THREE.MathUtils.lerp(a.snap.p[o + 2], b.snap.p[o + 2], k);
       tmpQ.set(a.snap.p[o + 3], a.snap.p[o + 4], a.snap.p[o + 5], a.snap.p[o + 6]);
       tmpQ2.set(b.snap.p[o + 3], b.snap.p[o + 4], b.snap.p[o + 5], b.snap.p[o + 6]);
-      tmpQ.slerp(tmpQ2, k);
+      tmpQ.slerp(tmpQ2, rotationK);
       out[o + 3] = tmpQ.x;
       out[o + 4] = tmpQ.y;
       out[o + 5] = tmpQ.z;
@@ -1731,7 +1880,7 @@ export class Game {
           prop.mesh.position.set(THREE.MathUtils.lerp(pa[j + 1], pb[i + 1], k), THREE.MathUtils.lerp(pa[j + 2], pb[i + 2], k), THREE.MathUtils.lerp(pa[j + 3], pb[i + 3], k));
           tmpQ.set(pa[j + 4], pa[j + 5], pa[j + 6], pa[j + 7]);
           tmpQ2.set(pb[i + 4], pb[i + 5], pb[i + 6], pb[i + 7]);
-          prop.mesh.quaternion.copy(tmpQ.slerp(tmpQ2, k));
+          prop.mesh.quaternion.copy(tmpQ.slerp(tmpQ2, rotationK));
         } else {
           prop.mesh.position.set(pb[i + 1], pb[i + 2], pb[i + 3]);
           prop.mesh.quaternion.set(pb[i + 4], pb[i + 5], pb[i + 6], pb[i + 7]);
@@ -1890,6 +2039,8 @@ function validateSnapshot(value: unknown): Snap | null {
   if (raw.checkpointIdx !== undefined && (typeof raw.checkpointIdx !== "number" || !Number.isInteger(raw.checkpointIdx))) return null;
   for (const key of ["delivered", "running", "finished"]) if (raw[key] !== undefined && typeof raw[key] !== "boolean") return null;
   if (raw.reactor !== undefined && !isPhysicsReactorSnapshot(raw.reactor, PART_COUNT)) return null;
+  if (raw.commentary !== undefined && !isCommentaryCue(raw.commentary)) return null;
+  if (raw.commentaryState !== undefined && !isCommentarySnapshot(raw.commentaryState)) return null;
   return {
     t: raw.t as number,
     p: [...raw.p],
@@ -1909,6 +2060,8 @@ function validateSnapshot(value: unknown): Snap | null {
     score: raw.score as number,
     ev: raw.ev as Snap["ev"],
     msg: typeof raw.msg === "string" && raw.msg.length <= 512 ? raw.msg : undefined,
+    commentary: raw.commentary as CommentaryCue | undefined,
+    commentaryState: raw.commentaryState as CommentarySnapshot | undefined,
     reactor: raw.reactor as PhysicsReactorSnapshot | undefined,
   };
 }

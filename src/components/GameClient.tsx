@@ -2,12 +2,11 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
-import { CHALLENGES, ROLE_INFO, formatTime, squadRoles, type Role, type RoleInput, type RoomSnapshot, type SquadSize } from "@/game/types";
+import { CHALLENGES, formatTime, type Role, type RoleInput, type RoomSnapshot, type SquadSize } from "@/game/types";
 import type { Game, HudState, Snap } from "@/game/game";
 import { Net } from "@/game/net";
 import { InputManager, inputsEqual } from "@/game/input";
 import { getLevel } from "@/game/levels";
-import { RoleGlyph } from "@/components/RoleGlyph";
 
 interface ScoreRow {
   id: number;
@@ -20,8 +19,18 @@ interface ScoreRow {
 interface Toast {
   id: number;
   text: string;
-  tone: "good" | "bad" | "info";
+  tone: "good" | "bad" | "warning" | "info";
+  source: "message" | "commentary";
 }
+
+const CREW_CONTROLS = [
+  { key: "W / S", does: "Waddle forward / back" },
+  { key: "A / D", does: "Steer the whole wobble" },
+  { key: "Q + WASD", does: "Take the left hand" },
+  { key: "E + WASD", does: "Take the right hand" },
+  { key: "Space", does: "Hop / bounce back up" },
+  { key: "Shift", does: "Duck-boost · yeet · QUACK" },
+] as const;
 
 function secureId() {
   if (typeof globalThis.crypto?.randomUUID === "function") return globalThis.crypto.randomUUID();
@@ -59,7 +68,6 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
   const uiTimersRef = useRef(new Set<ReturnType<typeof setTimeout>>());
   const lastSentRef = useRef<Record<string, RoleInput>>({});
   const lastSendTimeRef = useRef(0);
-  const activeRoleRef = useRef(0);
   const creatingRef = useRef(false);
   const phaseRef = useRef<string>("");
   const roundRef = useRef(-1);
@@ -74,13 +82,11 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
   const [hud, setHud] = useState<HudState | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [countdown, setCountdown] = useState<number | null>(null);
-  const [activeRole, setActiveRole] = useState(0);
   const [leaderboard, setLeaderboard] = useState<ScoreRow[]>([]);
   const [boardSquad, setBoardSquad] = useState<SquadSize>(5);
   const [muted, setMuted] = useState(false);
   const [gameReady, setGameReady] = useState(false);
   const [connErr, setConnErr] = useState(false);
-  const [pointerLocked, setPointerLocked] = useState(false);
   const [finishToast, setFinishToast] = useState<{ team: string; time: number; color: string } | null>(null);
   const [myFinish, setMyFinish] = useState<number | null>(null);
   const [roleCardOpen, setRoleCardOpen] = useState(() => typeof window === "undefined" || !window.matchMedia("(max-width: 767px)").matches);
@@ -88,10 +94,7 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
   const me = useMemo(() => room?.players.find((p) => p.id === identity.pid) ?? null, [room, identity.pid]);
   const myTeam = useMemo(() => room?.teams.find((t) => t.id === me?.teamId) ?? null, [room, me]);
   const isLeader = !!room && !!me && room.leaderId === me.id;
-  const isHost = !!myTeam && !!me && myTeam.hostId === me.id;
-  const myRoles = me?.roles ?? [];
   const ready = me?.ready ?? false;
-  const currentRole: Role | null = myRoles[Math.min(activeRole, Math.max(0, myRoles.length - 1))] ?? null;
   const challenge = CHALLENGES.find((c) => c.id === room?.challengeId) ?? CHALLENGES[0];
 
   const scheduleUiTimeout = useCallback((fn: () => void, delay: number) => {
@@ -103,9 +106,12 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
     return timer;
   }, []);
 
-  const addToast = useCallback((text: string, tone: Toast["tone"] = "info") => {
+  const addToast = useCallback((text: string, tone: Toast["tone"] = "info", source: Toast["source"] = "message") => {
     const id = ++toastId.current;
-    setToasts((t) => [...t.slice(-3), { id, text, tone }]);
+    setToasts((toasts) => {
+      const available = source === "commentary" ? toasts.filter((toast) => toast.source !== "commentary") : toasts;
+      return [...available.slice(-3), { id, text, tone, source }];
+    });
     scheduleUiTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 2600);
   }, [scheduleUiTimeout]);
 
@@ -216,24 +222,12 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
     net.connect();
     const input = new InputManager();
     inputRef.current = input;
-    input.onRoleSwitch = (dir, idx) => {
-      const n = roomRef.current?.players.find((p) => p.id === ids.pid)?.roles.length ?? 0;
-      if (n <= 1) return;
-      let next = activeRoleRef.current;
-      if (dir === "index") next = Math.min(n - 1, idx ?? 0);
-      else next = (next + (dir as number) + n) % n;
-      activeRoleRef.current = next;
-      setActiveRole(next);
-    };
-    const onPL = () => setPointerLocked(document.pointerLockElement === canvasRef.current);
-    document.addEventListener("pointerlockchange", onPL);
     const beforeUnload = () => net.close();
     const uiTimers = uiTimersRef.current;
     window.addEventListener("beforeunload", beforeUnload);
     return () => {
       sessionGenerationRef.current = generation + 1;
       window.removeEventListener("beforeunload", beforeUnload);
-      document.removeEventListener("pointerlockchange", onPL);
       net.close();
       input.detach();
       gameRef.current?.dispose();
@@ -269,6 +263,7 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
           if (sessionGenerationRef.current !== generation || netRef.current !== expectedNet) return;
           if (ev.type === "hud") setHud(ev.hud);
           else if (ev.type === "message") addToast(ev.text, ev.tone);
+          else if (ev.type === "commentary") addToast(ev.cue.text, ev.cue.tone, "commentary");
           else if (ev.type === "finish") {
             setMyFinish(ev.timeMs);
             const r = roomRef.current;
@@ -310,8 +305,6 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
     if (g.level.id !== room.challengeId) {
       g.setLevel(room.challengeId);
       if (inputRef.current) {
-        inputRef.current.yaw = g.level.spawnYaw;
-        inputRef.current.pitch = 0;
       }
       g.freeRoam();
     }
@@ -332,8 +325,6 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
         });
         g.prepareRun();
         if (inputRef.current) {
-          inputRef.current.yaw = g.level.spawnYaw;
-          inputRef.current.pitch = 0;
         }
         ensureAudio();
         const net = netRef.current!;
@@ -390,11 +381,8 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
   // ---------- input loop ----------
   useEffect(() => {
     let raf = 0;
-    let last = performance.now();
-    const loop = (now: number) => {
+    const loop = () => {
       raf = requestAnimationFrame(loop);
-      const dt = Math.min(0.1, (now - last) / 1000);
-      last = now;
       const g = gameRef.current;
       const input = inputRef.current;
       const r = roomRef.current;
@@ -402,23 +390,19 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
       if (!g || !input || !r || !pid) return;
       const meNow = r.players.find((p) => p.id === pid);
       if (!meNow) return;
-      const roles = meNow.roles;
-      const idx = Math.min(activeRoleRef.current, Math.max(0, roles.length - 1));
-      const active = roles[idx];
+      const channel = meNow.roles[0];
       input.enabled = r.phase !== "results";
-      // Torso steers the camera (legacy Head role also works)
-      input.tickHead(dt, active === "torso" || active === "head");
       const payload: Partial<Record<Role, RoleInput>> = {};
       let changed = false;
       if (g.isHost) g.localInputs = {};
-      for (const role of roles) {
-        const inp = input.read(role, role === active);
-        payload[role] = inp;
-        if (g.isHost) g.setLocalInput(role, inp);
-        const prev = lastSentRef.current[role];
+      if (channel) {
+        const inp = input.read(channel, true);
+        payload[channel] = inp;
+        if (g.isHost) g.setLocalInput(channel, inp);
+        const prev = lastSentRef.current[channel];
         if (!prev || !inputsEqual(prev, inp)) changed = true;
       }
-      if (!g.isHost && roles.length > 0) {
+      if (!g.isHost && channel) {
         const t = performance.now();
         if ((changed && t - lastSendTimeRef.current > 45) || t - lastSendTimeRef.current > 200) {
           lastSendTimeRef.current = t;
@@ -444,7 +428,7 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
   };
   const onCanvasClick = () => {
     ensureAudio();
-    if ((myRoles.includes("torso") || myRoles.includes("head")) && room?.phase !== "lobby") inputRef.current?.requestPointerLock();
+    canvasRef.current?.focus();
   };
 
   const copyInviteLink = async () => {
@@ -476,7 +460,7 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
       />
       <div className="game-cinematic-overlay" aria-hidden="true" />
       <div id="game-help" className="sr-only">
-        Use your assigned body-part keys to move. Click the game canvas to capture the mouse when controlling the head or torso.
+        Everyone can move the shared body. Use W and S to waddle, A and D to steer, Q or E with WASD to control a hand, Space to hop, and Shift to boost, throw, and quack.
       </div>
 
       {/* Loading */}
@@ -563,64 +547,36 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
         </div>
       )}
 
-      {/* Role card */}
-      {room && me && currentRole && (
+      {/* Shared controls */}
+      {room && me && (
         <div className="absolute bottom-[max(0.75rem,env(safe-area-inset-bottom))] left-3 z-20 w-[min(360px,calc(100vw-1.5rem))] sm:bottom-4 sm:left-4">
-          {myRoles.length > 1 && (
-          <div className="mb-2 flex gap-1 overflow-x-auto pb-0.5">
-              {myRoles.map((r, i) => (
-                <button
-                  type="button"
-                  key={r}
-                  onClick={() => {
-                    activeRoleRef.current = i;
-                    setActiveRole(i);
-                  }}
-                  className={`flex min-h-[3.25rem] w-[4.25rem] shrink-0 flex-col items-center justify-center rounded-lg border border-white/10 px-1.5 py-1.5 text-[10px] font-bold transition focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#c2ff7a] ${i === activeRole ? "bg-[#c2ff7a] text-black" : "bg-black/55 text-white/80 hover:bg-black/70"}`}
-                  aria-pressed={i === activeRole}
-                >
-                  <span className="flex items-center gap-1 opacity-70" aria-hidden="true"><span>{i + 1}</span><RoleGlyph role={r} className="h-3.5 w-3.5" /></span>
-                  <span className="mt-0.5 tracking-wide">{ROLE_INFO[r].short}</span>
-                </button>
-              ))}
-            </div>
-          )}
           <div className="w-[min(320px,100%)] overflow-hidden rounded-2xl border border-white/10 bg-[#080b0c]/80 shadow-[0_18px_60px_rgba(0,0,0,0.4)] backdrop-blur-xl">
             <button
               type="button"
               onClick={() => setRoleCardOpen((open) => !open)}
               className="flex min-h-11 w-full items-center justify-between gap-3 px-4 py-3 text-left focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-[#c2ff7a] md:cursor-default"
               aria-expanded={roleCardOpen}
-              aria-controls="role-controls"
+              aria-controls="crew-controls"
             >
-              <span className="flex items-center gap-3">
-                <RoleGlyph role={currentRole} className="h-9 w-9 text-white/85" />
-                <span>
-                  <span className="block text-[10px] uppercase tracking-widest text-white/60">You control</span>
-                  <span className="block text-lg font-black sm:text-xl" style={{ color: myTeam?.color }}>
-                    {ROLE_INFO[currentRole].label}
-                  </span>
+              <span>
+                <span className="block text-[10px] uppercase tracking-widest text-[#c2ff7a]">No body-part jobs</span>
+                <span className="block text-lg font-black sm:text-xl" style={{ color: myTeam?.color }}>
+                  Everybody drives
                 </span>
               </span>
               <span className="text-xs font-black uppercase tracking-widest text-white/55 md:hidden" aria-hidden="true">{roleCardOpen ? "Hide" : "Show"}</span>
             </button>
             {roleCardOpen && (
-              <div id="role-controls" className="border-t border-white/10 px-4 pb-4 pt-3">
+              <div id="crew-controls" className="border-t border-white/10 px-4 pb-4 pt-3">
                 <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
-                  {ROLE_INFO[currentRole].keys.map((k) => (
+                  {CREW_CONTROLS.map((k) => (
                     <div key={k.key} className="contents">
                       <kbd className="rounded bg-white/15 px-1.5 py-0.5 font-mono text-[11px] font-bold whitespace-nowrap">{k.key}</kbd>
                       <span className="text-white/80">{k.does}</span>
                     </div>
                   ))}
-                  {myRoles.length > 1 && (
-                    <div className="contents">
-                      <kbd className="rounded bg-white/15 px-1.5 py-0.5 font-mono text-[11px] font-bold">Tab / 1-5</kbd>
-                      <span className="text-white/80">Switch body part</span>
-                    </div>
-                  )}
                 </div>
-                {currentRole === "head" && !pointerLocked && phase !== "lobby" && <div className="mt-3 text-[11px] leading-relaxed text-[#c2ff7a]">Click the game to capture the mouse</div>}
+                <div className="mt-3 text-[11px] leading-relaxed text-white/60">Matching inputs move fast. Opposite inputs create premium chaos.</div>
               </div>
             )}
           </div>
@@ -629,29 +585,23 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
 
       {/* Status chips */}
       {hud && phase !== "lobby" && (
-        <div className={`pointer-events-none absolute right-3 z-20 flex max-w-[calc(100vw-1.5rem)] flex-col items-end gap-2 sm:bottom-4 sm:right-4 ${roleCardOpen && currentRole ? "bottom-[max(14.5rem,calc(env(safe-area-inset-bottom)+13.75rem))]" : "bottom-[max(0.75rem,env(safe-area-inset-bottom))]"}`} aria-live="polite">
-          {hud.fallen && <div className="animate-pulse rounded-xl bg-[#ff5d5d] px-4 py-2 font-black shadow-lg">FALLEN! Torso: hold SPACE to get up</div>}
+        <div className={`pointer-events-none absolute right-3 z-20 flex max-w-[calc(100vw-1.5rem)] flex-col items-end gap-2 sm:bottom-4 sm:right-4 ${roleCardOpen ? "bottom-[max(14.5rem,calc(env(safe-area-inset-bottom)+13.75rem))]" : "bottom-[max(0.75rem,env(safe-area-inset-bottom))]"}`} aria-live="polite">
+          {hud.fallen && <div className="animate-pulse rounded-xl bg-[#ff5d5d] px-4 py-2 font-black shadow-lg">TACTICAL NAP · SPACE helps the bounce-back</div>}
           {!hud.fallen && hud.supportFeet > 0 && hud.stabilityMargin < -0.1 && (
-            <div className="animate-pulse rounded-xl bg-[#ffd23f] px-4 py-2 font-black text-black shadow-lg">UNSTABLE · Torso: counter-lean or brace!</div>
+            <div className="animate-pulse rounded-xl bg-[#ffd23f] px-4 py-2 font-black text-black shadow-lg">MAXIMUM WOBBLE · steer together… or don’t</div>
           )}
           {hud.gripStress > 0.82 && (
             <div className="animate-pulse rounded-xl bg-[#ff9a3c] px-4 py-2 font-black text-black shadow-lg">GRIP SLIPPING · Hands: align and share the load!</div>
           )}
-          {hud.hanging && <div className="rounded-xl bg-[#4fa8ff] px-4 py-2 font-black shadow-lg">HANGING · Arms: S to pull up · Legs: step!</div>}
-          {hud.holding > 0 && !hud.hanging && <div className="rounded-xl bg-[#6ef29a] text-black px-4 py-2 font-black shadow-lg">HOLDING · Arms: Shift to throw</div>}
-          {hud.crouch && <div className="rounded-xl bg-black/50 px-3 py-1 text-sm font-bold">Crouching</div>}
-          {isHost && hud.brace < 1 && (
-            <div className="w-40 rounded-full bg-black/50 p-1">
-              <div className="h-2 rounded-full bg-[#c2ff7a] transition-all" style={{ width: `${hud.brace * 100}%` }} />
-            </div>
-          )}
+          {hud.hanging && <div className="rounded-xl bg-[#4fa8ff] px-4 py-2 font-black shadow-lg">HANGING · hold Q / E + S to scramble up</div>}
+          {hud.holding > 0 && !hud.hanging && <div className="rounded-xl bg-[#6ef29a] text-black px-4 py-2 font-black shadow-lg">GOT IT · keep Q / E held · SHIFT together to yeet</div>}
         </div>
       )}
 
       {/* Toasts */}
       <div className="pointer-events-none absolute left-1/2 top-[22%] z-30 flex w-[min(92vw,34rem)] -translate-x-1/2 flex-col items-center gap-2" aria-live="polite" aria-atomic="true">
         {toasts.map((t) => (
-          <div key={t.id} className={`toast max-w-full rounded-2xl px-5 py-2 text-center text-sm font-black shadow-xl sm:text-lg ${t.tone === "good" ? "bg-[#6ef29a] text-black" : t.tone === "bad" ? "bg-[#ff5d5d]" : "bg-black/60"}`}>
+          <div key={t.id} className={`toast max-w-full rounded-2xl px-5 py-2 text-center text-sm font-black shadow-xl sm:text-lg ${t.tone === "good" ? "bg-[#6ef29a] text-black" : t.tone === "bad" ? "bg-[#ff5d5d]" : t.tone === "warning" ? "bg-[#ffd23f] text-black" : "bg-black/60"}`}>
             {t.text}
           </div>
         ))}
@@ -698,7 +648,7 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
                 Copy invite link
               </button>
             </div>
-            <div className="mt-2 text-xs text-white/60">Friends open the link, pick a body part, ready up. Missing parts get shared (Tab to switch).</div>
+            <div className="mt-2 text-xs text-white/60">Friends open the link, ready up, and drive the same gloriously unstable body.</div>
           </div>
 
           {/* Squad size */}
@@ -709,18 +659,18 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
                 <button
                   type="button"
                   key={n}
-                  disabled={!isLeader}
+                  disabled={!isLeader || room.teams.some((team) => room.players.filter((player) => player.teamId === team.id).length > n)}
                   onClick={() => send("setSquad", { squadSize: n })}
                   className={`min-h-11 rounded-xl px-3 py-2 text-left transition focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#c2ff7a] ${room.squadSize === n ? "bg-[#c2ff7a] text-black" : "bg-white/5 hover:bg-white/10 disabled:hover:bg-white/5"}`}
                 >
                   <div className="font-black leading-tight">{n} players</div>
                   <div className={`text-xs ${room.squadSize === n ? "text-black/70" : "text-white/60"}`}>
-                    {n === 3 ? "Arms · Torso · Legs" : "2 hands · Torso · 2 legs"}
+                    Same controls · {n === 3 ? "tight crew" : "maximum chaos"}
                   </div>
                 </button>
               ))}
             </div>
-            <div className="mt-2 text-xs text-white/60">Separate leaderboards for 3P and 5P. Switching clears role picks.</div>
+            <div className="mt-2 text-xs text-white/60">Separate leaderboards for 3P and 5P. Switching changes the team capacity.</div>
           </div>
 
           {/* Challenge */}
@@ -770,26 +720,9 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
                     </button>
                   )}
                 </div>
-                <div className={`mt-3 grid gap-1 ${room.squadSize === 3 ? "grid-cols-3" : "grid-cols-5"}`}>
-                  {squadRoles(room.squadSize).map((r) => {
-                    const owner = members.find((m) => m.roles.includes(r));
-                    const isMe = owner?.id === me.id;
-                    return (
-                      <button
-                        type="button"
-                        key={r}
-                        disabled={!mine}
-                        onClick={() => send("setRole", { role: r })}
-                        title={ROLE_INFO[r].blurb}
-                        className={`flex min-h-11 flex-col items-center rounded-xl px-1 py-2 text-center transition focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#c2ff7a] ${isMe ? "text-black" : owner ? "bg-white/15" : "bg-white/5 hover:bg-white/10"}`}
-                        style={isMe ? { background: t.color } : undefined}
-                      >
-                        <RoleGlyph role={r} className="h-6 w-6" />
-                        <span className="text-[9px] font-black uppercase tracking-wide">{ROLE_INFO[r].short}</span>
-                        <span className={`mt-0.5 line-clamp-1 text-[10px] ${isMe ? "text-black/80" : "text-white/70"}`}>{owner ? owner.name : "free"}</span>
-                      </button>
-                    );
-                  })}
+                <div className="mt-3 rounded-xl bg-white/[0.06] px-3 py-2.5">
+                  <div className="text-[10px] font-black uppercase tracking-[0.16em] text-[#c2ff7a]">Shared controls</div>
+                  <div className="mt-1 text-xs leading-relaxed text-white/70">Every seat moves the body. Grab a hand with Q or E when the team needs it.</div>
                 </div>
                 <div className="mt-2 flex flex-wrap gap-1">
                   {members.map((m) => (

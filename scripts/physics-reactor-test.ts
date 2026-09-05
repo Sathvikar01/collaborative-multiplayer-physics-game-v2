@@ -135,14 +135,14 @@ function snapshotMaxDifference(a: PhysicsReactorSnapshot, b: PhysicsReactorSnaps
 async function main() {
   await RAPIER.init();
 
-  // 5P must preserve separate hand intent. A shared grab requires both Space
-  // inputs, while Q/E still address one hand independently.
+  // Every network seat can drive, while Q/E temporarily route that player's
+  // WASD into the left/right hand channels.
   {
     const state = makeSquadMixState();
     const mixed = resolvePhysInputs(
       {
-        lhand: input({ f: 1, s: 1, a: true }),
-        rhand: input({ f: -1, s: -1, a: true }),
+        lhand: input({ f: 1, s: 1, q: true }),
+        rhand: input({ f: -1, s: -1, e: true }),
       },
       5,
       DT,
@@ -164,22 +164,16 @@ async function main() {
     assert.equal(oneHand.lhand.a, true);
     assert.equal(oneHand.rhand.a, false);
 
-    const skewState = makeSquadMixState();
-    const leftArrivesFirst = resolvePhysInputs(
-      { lhand: input({ a: true }), rhand: input() },
-      5,
-      0.05,
-      skewState,
+    const bothHands = resolvePhysInputs(
+      { arms: input({ q: true, e: true, f: 0.5 }) },
+      3,
+      DT,
+      makeSquadMixState(),
     );
-    assert.equal(leftArrivesFirst.lhand.a, false);
-    const rightArrivesWithinGrace = resolvePhysInputs(
-      { lhand: input(), rhand: input({ a: true }) },
-      5,
-      0.05,
-      skewState,
-    );
-    assert.equal(rightArrivesWithinGrace.lhand.a, true);
-    assert.equal(rightArrivesWithinGrace.rhand.a, true);
+    assert.equal(bothHands.lhand.a, true);
+    assert.equal(bothHands.rhand.a, true);
+    assert.equal(bothHands.lhand.f, 0.5);
+    assert.equal(bothHands.rhand.f, 0.5);
   }
 
   // The fixed-step clock must produce the same state for equivalent elapsed
@@ -364,6 +358,9 @@ async function main() {
       assert.equal(lostBothSupports, true);
       const fall = events.find((event) => event.type === "fall");
       assert.equal(fall?.reason ?? rig.body.fallReason, "no-foot-support");
+      advance(rig, 3, makeInputs(), events);
+      assert.equal(rig.body.fallen, false, "a fall must recover without a dedicated torso player");
+      assert.ok(events.some((event) => event.type === "getup"), "automatic recovery should emit getup feedback");
     } finally {
       disposeRig(rig);
     }

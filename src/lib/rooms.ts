@@ -1,4 +1,5 @@
 import { CHALLENGES, TEAM_COLORS, squadRoles, type Phase, type Role, type RoleInput, type RoomSnapshot, type SquadSize } from "@/game/types";
+import { isCommentaryCue, isCommentarySnapshot } from "@/game/commentary";
 
 type Send = (event: string, data: unknown) => void;
 type Timer = ReturnType<typeof setTimeout>;
@@ -197,8 +198,15 @@ export function setRole(room: Room, playerId: string, role: Role) {
   changed(room); return true;
 }
 export function setSquadSize(room: Room, squad: SquadSize) {
-  if (room.phase !== "lobby" || (squad !== 3 && squad !== 5) || room.squadSize === squad) return false; room.squadSize = squad;
-  for (const pl of room.players) { pl.roles = []; pl.ready = false; } for (const t of room.teams) { const first = room.players.find((x) => x.teamId === t.id); if (first) first.roles = [squadRoles(squad)[0]]; }
+  if (room.phase !== "lobby" || (squad !== 3 && squad !== 5) || room.squadSize === squad) return false;
+  if (room.teams.some((team) => room.players.filter((player) => player.teamId === team.id).length > squad)) return false;
+  room.squadSize = squad;
+  for (const pl of room.players) { pl.roles = []; pl.ready = false; }
+  for (const t of room.teams) {
+    const members = room.players.filter((x) => x.teamId === t.id);
+    const seats = squadRoles(squad);
+    members.forEach((member, index) => { member.roles = seats[index] ? [seats[index]] : []; });
+  }
   changed(room); return true;
 }
 export function setTeam(room: Room, playerId: string, teamId: number | "new") {
@@ -299,8 +307,13 @@ function safeSnapshot(state: unknown) {
   if (s.delivered !== undefined && typeof s.delivered !== "boolean") return null;
   if (s.running !== undefined && typeof s.running !== "boolean") return null;
   if (s.finished !== undefined && typeof s.finished !== "boolean") return null;
+  const commentary = s.commentary === undefined ? undefined : isCommentaryCue(s.commentary) ? { ...s.commentary } : null;
+  if (commentary === null) return null;
+  const commentaryState = s.commentaryState === undefined ? undefined : isCommentarySnapshot(s.commentaryState) ? s.commentaryState : null;
+  if (commentaryState === null) return null;
   const reactor = s.reactor === undefined ? undefined : safeReactorState(s.reactor); if (s.reactor !== undefined && !reactor) return null;
-  const clean = { t: s.t, p: (s.p as number[]).map(Number), v: s.v ? (s.v as number[]).map(Number) : undefined, av: s.av ? (s.av as number[]).map(Number) : undefined, props: (s.props as number[]).map(Number), propMotion: s.propMotion ? (s.propMotion as number[]).map(Number) : undefined, moverT: s.moverT, checkpointIdx: s.checkpointIdx, delivered: s.delivered, running: s.running, finished: s.finished, yaw: s.yaw, pitch: s.pitch, timer: Math.max(0, s.timer as number), fallen: s.fallen, score: s.score, ev: s.ev, msg: typeof s.msg === "string" ? s.msg.slice(0, 256) : undefined, reactor };
+  if (s.running === true && commentaryState && reactor && commentaryState.lastTick !== reactor.tick) return null;
+  const clean = { t: s.t, p: (s.p as number[]).map(Number), v: s.v ? (s.v as number[]).map(Number) : undefined, av: s.av ? (s.av as number[]).map(Number) : undefined, props: (s.props as number[]).map(Number), propMotion: s.propMotion ? (s.propMotion as number[]).map(Number) : undefined, moverT: s.moverT, checkpointIdx: s.checkpointIdx, delivered: s.delivered, running: s.running, finished: s.finished, yaw: s.yaw, pitch: s.pitch, timer: Math.max(0, s.timer as number), fallen: s.fallen, score: s.score, ev: s.ev, msg: typeof s.msg === "string" ? s.msg.slice(0, 256) : undefined, commentary, commentaryState, reactor };
   return JSON.stringify(clean).length <= MAX_STATE_BYTES ? clean : null;
 }
 export function relayState(room: Room, playerId: string, sessionToken: string, connectionId: string, state: unknown, seq = 0) {

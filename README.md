@@ -1,6 +1,6 @@
 # Many Hands
 
-Many Hands is a browser-based cooperative physics game for three- or five-player teams. Every player controls part of one shared ragdoll body: hands grab, legs walk, and the torso balances and steers.
+Many Hands is a browser-based cooperative physics game for three- or five-player teams. Everyone drives the same shared ragdoll; players can temporarily take either hand to grab, carry, climb, and throw without assigning anyone a torso or leg job.
 
 The game is intentionally client-authoritative for physics: one browser is the team host, while the server coordinates rooms, relays inputs/snapshots, handles leases, and elects a replacement host when necessary.
 
@@ -31,6 +31,8 @@ npm run dev
 ```
 
 Open the URL printed by Next.js, normally `http://localhost:3000`. Choose **Create room**, or enter a four-character room code to join an existing room.
+
+Controls are shared by every player: `W/S` waddles, `A/D` steers, `Q + WASD` takes the left hand, `E + WASD` takes the right hand, `Space` hops or helps recovery, and `Shift` duck-boosts, throws, and quacks.
 
 Production-style local run:
 
@@ -97,7 +99,7 @@ flowchart TD
   SESSION -->|authenticated commands| ROOM
   ROOM --> LEADER
   ROOM --> HOST
-  GUEST -->|role input| ROOM
+  GUEST -->|crew input| ROOM
   ROOM -->|validated input relay| HOST
   HOST -->|15 Hz snapshot| SNAP
   SNAP --> GUEST
@@ -149,7 +151,7 @@ sequenceDiagram
   G->>G: clear old remote input leases
   Note over G: missing remote input becomes neutral after ~500 ms
   A-->>S: reconnect within 15 s grace
-  S->>S: restore membership and roles
+  S->>S: restore membership and control seat
   S-->>A: fresh room snapshot
   Note over S: reconnecting player does not reclaim replacement authority
   S->>S: remove player after grace expires
@@ -162,14 +164,20 @@ Important timings:
 | Input lease | ~500 ms | Stops held movement/grab/throw input from sticking on the host |
 | Client heartbeat | ~5 s | Refreshes the server connection lease |
 | Server lease | 15 s | Detects a half-open/hung connection |
-| Disconnect grace | 15 s | Preserves team, role, and session membership for reconnect |
+| Disconnect grace | 15 s | Preserves team, control seat, and session membership for reconnect |
 | Command retry window | 60 s | Retries lost control-command responses with idempotency keys |
 
 Host takeover snapshots include body transforms/velocities, prop motion, mover phase, objective state, and a versioned reactor continuation containing limb-controller and logical grip state. A replacement host reconstructs compatible grips instead of unconditionally dropping the carried object.
 
 ### Cooperative physics
 
-Five-player hand and leg channels remain independent through the solver. Bilateral grabs attach both hands to the same target, share the load, and accumulate grip strain when the players pull in conflicting directions. Heavy one-hand loads slip and drop. Balance uses foot contact manifolds, whole-body/carried-load center of mass, a predicted capture point, and a support margin; moving both legs without torso correction removes support, while bracing increases limited recovery authority.
+Every transport seat contributes to one deterministic movement vote. Matching directions retain full authority, opposed directions cancel into a comic wobble, and an automatic alternating gait drives the internal leg channels. Holding `Q` or `E` routes that player's WASD input to the corresponding hand instead of locomotion. Multiplayer two-hand grabs and throws require two distinct contributors, so hand disagreement still creates real force, grip strain, slips, and drops. Balance and recovery are assisted automatically; falling is funny rather than a torso-player lockout.
+
+### State-aware commentary
+
+The team host runs a passive `CommentaryDirector` beside the fixed-step simulation. It observes authorized role inputs, physics diagnostics, body events, and objective transitions, then emits at most one short cue for meaningful failures, near-fails, coordination mistakes, recoveries, progress, or completion. Tick-based hysteresis, cooldowns, and phrase rotation keep output deterministic and non-repetitive; the director never changes controls, physics, scoring, or level state.
+
+Commentary cues and the director's compact continuation state ride the existing authoritative snapshot stream. Guests deduplicate repeated cue IDs, and a replacement host restores the continuation so failover does not replay old advice.
 
 ## Repository map
 
@@ -186,6 +194,7 @@ src/
 ├─ components/GameClient.tsx            React session/UI coordinator
 ├─ game/
 │  ├─ game.ts                            Three.js rendering and game flow
+│  ├─ commentary.ts                      Deterministic state-aware team commentary
 │  ├─ physicsReactor.ts                  Fixed-step seam, diagnostics, takeover state
 │  ├─ body.ts                            Ragdoll and physics controller
 │  ├─ squad.ts                           3P/5P input mixer
@@ -227,7 +236,7 @@ Every request carries `playerId`, `sessionToken`, and `connectionId`. Realtime r
 | Command | Purpose | Authority |
 | --- | --- | --- |
 | `heartbeat` | Refresh connection lease | Authenticated player |
-| `input` | Send assigned-role input to team host | Connected guest |
+| `input` | Send assigned control-seat input to team host | Connected guest |
 | `state` | Broadcast authoritative team snapshot | Current team host |
 | `setRole`, `setTeam`, `ready` | Lobby setup | Connected player, lobby only |
 | `setChallenge`, `setSquad`, `start`, `lobby` | Room controls | Room leader |
@@ -273,7 +282,7 @@ Run the focused suite:
 npm test
 ```
 
-It covers stale SSE cleanup, reconnect role preservation, immediate host takeover, authenticated route commands, command idempotency, malformed input/state rejection, input expiry, realtime coalescing, fixed-step equivalence, contact-derived support, bilateral load sharing, grip failure, balance failure, and reactor snapshot restoration.
+It covers stale SSE cleanup, reconnect seat preservation, immediate host takeover, authenticated route commands, command idempotency, malformed input/state rejection, input expiry, bounded state pipelining, universal crew controls, deterministic commentary and snapshot deduplication, every role/challenge commentary playtest, delayed-snapshot presentation smoothness, fixed-step equivalence, contact-derived support, bilateral load sharing, grip failure, balance failure, and reactor snapshot restoration.
 
 For a complete pre-merge check:
 
@@ -328,7 +337,7 @@ Confirm that all requests are reaching the same Node process. This is the expect
 
 ### A player appears as “reconnecting”
 
-The server has detected a closed SSE or missed heartbeat. The player's role is retained during the grace window. Check browser console/network errors and verify that the SSE route is not being buffered or terminated by a proxy.
+The server has detected a closed SSE or missed heartbeat. The player's control seat is retained during the grace window. Check browser console/network errors and verify that the SSE route is not being buffered or terminated by a proxy.
 
 ### The leaderboard is empty
 

@@ -6,6 +6,7 @@ const calls: FetchCall[] = [];
 let finishFirstInput: ((response: Response) => void) | null = null;
 let inputAttempts = 0;
 let readyAttempts = 0;
+const finishStateRequests: ((response: Response) => void)[] = [];
 
 class FakeEventSource {
   static instances: FakeEventSource[] = [];
@@ -37,6 +38,11 @@ globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
   if (body.type === "input" && ++inputAttempts === 1) {
     return await new Promise<Response>((resolve) => {
       finishFirstInput = resolve;
+    });
+  }
+  if (body.type === "state") {
+    return await new Promise<Response>((resolve) => {
+      finishStateRequests.push(resolve);
     });
   }
   if (body.type === "ready" && ++readyAttempts === 1) throw new TypeError("simulated network outage");
@@ -78,6 +84,19 @@ try {
   assert.equal(readyCalls[0].body.commandId, readyCalls[1].body.commandId, "a retried command must keep its idempotency key");
   assert.equal(readyCalls[1].body.sessionToken, "session-token-0000000000000000");
   assert.equal(typeof readyCalls[1].body.connectionId, "string");
+
+  // Host snapshots are latency-sensitive but latest-wins. Keep a tiny bounded
+  // pipeline so one 140 ms POST cannot collapse a 15 Hz stream to ~7 Hz.
+  for (let seq = 0; seq < 5; seq++) net.send("state", { state: { frame: seq } });
+  await waitFor(() => calls.filter((call) => call.type === "state").length >= 3);
+  const startedStates = calls.filter((call) => call.type === "state");
+  assert.deepEqual(startedStates.slice(0, 3).map((call) => call.body.seq), [1, 2, 3], "state channel should pipeline three snapshots");
+  assert.equal(startedStates.length, 3, "state upload concurrency must stay bounded");
+  finishStateRequests.splice(1, 1)[0](new Response("{}", { status: 200 }));
+  await waitFor(() => calls.filter((call) => call.type === "state").length === 4);
+  assert.equal(calls.filter((call) => call.type === "state")[3].body.seq, 5, "backpressure should retain only the newest waiting snapshot");
+  assert.equal(finishStateRequests.length, 3, "out-of-order completion must keep state concurrency bounded");
+  for (const finish of finishStateRequests.splice(0)) finish(new Response("{}", { status: 200 }));
 
   net.close();
   assert.equal(FakeEventSource.instances[0].closed, true);

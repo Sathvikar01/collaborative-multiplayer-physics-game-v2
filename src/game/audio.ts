@@ -334,10 +334,21 @@ export class GameAudio {
   getup() {
     this.tone(200, 0.25, { type: "triangle", vol: 0.09, slide: 1.8 });
   }
+  quack() {
+    if (!this.throttle("quack", 150)) return;
+    const f = 230 + Math.random() * 28;
+
+    // A quick nasal voice, falling formant, and tiny beak transient make a
+    // recognizable duck call without letting the deliberately goofy sound
+    // become harsh or tiring during repeated multiplayer reactions.
+    this.tone(f, 0.16, { type: "triangle", vol: 0.1, slide: 0.64, attack: 0.002 });
+    this.tone(f * 1.72, 0.12, { type: "square", vol: 0.035, slide: 0.55, attack: 0.001 });
+    this.noise(0.13, { vol: 0.055, lp: 1750, hp: 430, slideLp: 760, attack: 0.002 });
+    this.noise(0.022, { vol: 0.026, lp: 4800, hp: 1900, attack: 0.001 });
+  }
   shout() {
-    const f = 300 + Math.random() * 200;
-    this.tone(f, 0.18, { type: "sawtooth", vol: 0.08, slide: 1.3 });
-    this.tone(f * 1.5, 0.22, { type: "square", vol: 0.04, slide: 0.8 });
+    // Kept as an alias so existing call sites get the new character sound.
+    this.quack();
   }
   splash() {
     this.noise(0.6, { vol: 0.25, lp: 1800, slideLp: 300, hp: 100 });

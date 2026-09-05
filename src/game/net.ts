@@ -8,7 +8,7 @@ type RequestItem = {
 
 type CoalescedChannel = {
   pending: RequestItem | null;
-  running: boolean;
+  running: number;
 };
 
 const COALESCED_TYPES = new Set(["input", "state", "heartbeat"]);
@@ -123,21 +123,31 @@ export class Net {
     this.finishRetryWait = null;
   }
 
-  private async queueCoalesced(item: RequestItem) {
+  private queueCoalesced(item: RequestItem) {
     if (this.closed) return;
-    const channel = this.channels.get(item.type) ?? { pending: null, running: false };
+    const channel = this.channels.get(item.type) ?? { pending: null, running: 0 };
     channel.pending = item;
     this.channels.set(item.type, channel);
-    if (channel.running) return;
-    channel.running = true;
+    this.pumpCoalesced(item.type, channel);
+  }
+
+  private pumpCoalesced(type: string, channel: CoalescedChannel) {
+    const maxConcurrent = type === "state" ? 3 : 1;
+    while (!this.closed && channel.pending && channel.running < maxConcurrent) {
+      const next = channel.pending;
+      channel.pending = null;
+      channel.running++;
+      void this.runCoalesced(type, channel, next);
+    }
+  }
+
+  private async runCoalesced(type: string, channel: CoalescedChannel, item: RequestItem) {
     try {
-      while (!this.closed && channel.pending) {
-        const next = channel.pending;
-        channel.pending = null;
-        await this.post(next);
-      }
+      await this.post(item);
     } finally {
-      channel.running = false;
+      channel.running--;
+      if (this.closed) channel.pending = null;
+      else this.pumpCoalesced(type, channel);
     }
   }
 

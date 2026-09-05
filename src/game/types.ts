@@ -1,11 +1,12 @@
 export const PHYS_ROLES = ["head", "lhand", "rhand", "torso", "lleg", "rleg"] as const;
 export type PhysRole = (typeof PHYS_ROLES)[number];
 
-// Squad roles players actually pick. 3-player: arms+torso+legs. 5-player: split hands + split legs.
+// Stable transport-seat IDs retained for room/reconnect compatibility. Gameplay
+// treats every occupied seat as a universal crew controller.
 export const ROLES_3 = ["arms", "torso", "legs"] as const;
 export const ROLES_5 = ["lhand", "rhand", "torso", "lleg", "rleg"] as const;
 export type SquadSize = 3 | 5;
-// Union of every assignable role (legacy head kept for old rooms).
+// Union of every transport seat (legacy head kept for old rooms).
 export const ROLES = ["arms", "torso", "legs", "lhand", "rhand", "lleg", "rleg", "head"] as const;
 export type Role = (typeof ROLES)[number];
 
@@ -13,6 +14,7 @@ export function squadRoles(squad: SquadSize): readonly Role[] {
   return squad === 3 ? ROLES_3 : ROLES_5;
 }
 
+/** Legacy body-part metadata retained only for old room payloads. */
 export const ROLE_INFO: Record<Role, { label: string; short: string; emoji: string; blurb: string; keys: { key: string; does: string }[] }> = {
   head: {
     label: "Head & Eyes (legacy)",

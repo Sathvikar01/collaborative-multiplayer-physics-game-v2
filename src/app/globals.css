@@ -77,4 +77,7 @@ h1 em { color: var(--warm); font-style: normal; }
 @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; } }
 @media (prefers-reduced-transparency: reduce) { .action-panel { background: var(--panel); backdrop-filter: none; } }
 .role-card__glyph { display: block; width: 31px; height: 31px; margin: 24px 0 13px; color: var(--warm); }
+.control-card__keys { display: flex; min-height: 31px; align-items: center; gap: 5px; margin: 24px 0 13px; color: rgba(237, 242, 236, .5); font-size: .62rem; }
+.control-card__keys kbd { display: inline-flex; min-width: 27px; height: 27px; align-items: center; justify-content: center; border: 1px solid rgba(221, 213, 183, .45); padding: 0 7px; background: rgba(221, 213, 183, .08); color: var(--warm); box-shadow: 0 3px 9px rgba(0, 0, 0, .2); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .63rem; font-weight: 800; letter-spacing: .05em; }
 @media (max-width: 700px) { .role-card__glyph { margin-top: 20px; } }
+@media (max-width: 700px) { .control-card__keys { margin-top: 20px; } }

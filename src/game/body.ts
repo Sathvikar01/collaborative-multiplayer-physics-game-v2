@@ -193,6 +193,7 @@ export class RagdollBody {
   private previousComReady = false;
   private heldTargetVelocity = new Map<number, THREE.Vector3>();
   private skipSupportSampleOnce = false;
+  private recoveryFallbackUsed = false;
 
   /** Compatibility aliases consumed by the fixed-step reactor diagnostics. */
   get centreOfMass() {
@@ -351,6 +352,37 @@ export class RagdollBody {
     this.previousComReady = false;
     this.heldTargetVelocity.clear();
     this.skipSupportSampleOnce = false;
+    this.recoveryFallbackUsed = false;
+  }
+
+  /**
+   * Last-resort recovery for a ragdoll wedged in a pose the muscle controller
+   * cannot escape. Rotate the complete articulated body as one rigid cluster,
+   * preserving every joint's relative geometry and heavily damping velocity.
+   */
+  private applyUprightRecoveryFallback(groundDistance: number) {
+    const pivot = this.pelvisPos(new THREE.Vector3());
+    const current = this.quat(PELVIS, new THREE.Quaternion());
+    const upright = new THREE.Quaternion().setFromAxisAngle(UP, this.heading);
+    const correction = upright.multiply(current.clone().invert()).normalize();
+    const lift = clamp(PELVIS_H + 0.03 - groundDistance, 0, 0.8);
+
+    for (const rb of this.parts) {
+      const translation = rb.translation();
+      const rotation = rb.rotation();
+      const local = new THREE.Vector3(translation.x - pivot.x, translation.y - pivot.y, translation.z - pivot.z)
+        .applyQuaternion(correction);
+      const nextPos = local.add(pivot);
+      const nextRot = correction.clone().multiply(new THREE.Quaternion(rotation.x, rotation.y, rotation.z, rotation.w)).normalize();
+      const velocity = rb.linvel();
+      const angular = rb.angvel();
+      rb.setTranslation({ x: nextPos.x, y: nextPos.y + lift, z: nextPos.z }, true);
+      rb.setRotation({ x: nextRot.x, y: nextRot.y, z: nextRot.z, w: nextRot.w }, true);
+      rb.setLinvel({ x: velocity.x * 0.2, y: Math.max(0, velocity.y * 0.2), z: velocity.z * 0.2 }, true);
+      rb.setAngvel({ x: angular.x * 0.1, y: angular.y * 0.1, z: angular.z * 0.1 }, true);
+    }
+    this.recoveryFallbackUsed = true;
+    this.skipSupportSampleOnce = true;
   }
 
   private emit(type: BodyEvent["type"], p: THREE.Vector3, extra?: Partial<BodyEvent>) {
@@ -606,11 +638,17 @@ export class RagdollBody {
     // ---- Torso ----
     const wantCrouch = inp.torso.b ? 1 : 0;
     this.crouch = lerp(this.crouch, wantCrouch, 1 - Math.exp(-dt * 8));
+    const movementIntent = clamp(Math.max(
+      Math.hypot(inp.lleg.f, inp.lleg.s),
+      Math.hypot(inp.rleg.f, inp.rleg.s),
+    ), 0, 1);
     if (inp.torso.a && !this.fallen && this.braceStamina > 0) {
       this.brace = 1;
       this.braceStamina = Math.max(0, this.braceStamina - dt / 2.5);
     } else {
-      this.brace = 0;
+      // Locomotion no longer needs a dedicated torso player. A light automatic
+      // brace keeps the gait usable while retaining plenty of comic wobble.
+      this.brace = lerp(this.brace, this.fallen ? 0 : movementIntent * 0.32, 1 - Math.exp(-dt * 10));
       this.braceStamina = Math.min(1, this.braceStamina + dt / 4);
     }
     const leanF = inp.torso.f;
@@ -677,15 +715,21 @@ export class RagdollBody {
       this.fallReason = supportedFeet === 0 ? "no-foot-support" : this.unstableT > 0.42 ? "capture-point-outside-support" : "excessive-tilt";
       this.fallT = 0;
       this.recoverT = 0;
+      this.recoveryFallbackUsed = false;
       this.releaseAll(true);
       this.emit("fall", pp, { reason: this.fallReason });
     }
     if (this.fallen) {
       this.fallT += dt;
-      const wantsUp = inp.torso.a;
+      // Give the impact a brief comedy beat, then always help the shared body
+      // back up. Torso input can still start recovery immediately in replays.
+      const wantsUp = inp.torso.a || this.fallT > 0.28;
       if (wantsUp) this.recoverT += dt;
       else this.recoverT = Math.max(0, this.recoverT - dt * 0.5);
       this.balance = clamp(this.recoverT / 0.7, 0, 1) * 0.75 + (this.fallT < 0.15 ? 0.4 : 0);
+      if (!this.recoveryFallbackUsed && this.fallT > 2.2 && this.recoverT > 1.5 && tilt >= 0.55) {
+        this.applyUprightRecoveryFallback(this.groundDist);
+      }
       if (this.recoverT > 0.5 && tilt < 0.55) {
         this.fallen = false;
         this.fallReason = null;
@@ -741,7 +785,10 @@ export class RagdollBody {
           if (L.t < 0.02) this.lastStrideLeg = i;
           const same = this.lastStrideLeg === i;
           const k = (same ? strength : 1) * (1 - L.t / 0.42);
-          const speedMax = 3.4 - this.crouch * 1.2;
+          // Shift is a shared sprint vote. Keep the cap deliberately bounded so
+          // extra seats cannot stack it into unstable or divergent physics.
+          const boosted = inp.lleg.b || inp.rleg.b;
+          const speedMax = clamp(3.4 + (boosted ? 1.8 : 0) - this.crouch * 1.2, 1.8, 5.2);
           const desired = _v2.copy(fwd).multiplyScalar(L.dir.y * speedMax).addScaledVector(right, L.dir.x * speedMax * 0.8);
           const requested = new THREE.Vector3(m * (desired.x - lin.x) * 6.5 * k, 0, m * (desired.z - lin.z) * 6.5 * k);
           const maxTraction = m * g * 1.15;

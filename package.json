@@ -7,9 +7,12 @@
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "next typegen && tsc --noEmit",
-    "test": "npm run test:resilience && npm run test:physics",
+    "test": "npm run test:resilience && npm run test:crew && npm run test:commentary && npm run test:physics && npm run test:multiplayer-perf",
     "test:resilience": "tsx scripts/resilience-test.ts",
-    "test:physics": "tsx scripts/physics-reactor-test.ts"
+    "test:crew": "tsx scripts/crew-controls-test.ts",
+    "test:commentary": "tsx scripts/commentary-test.ts && tsx scripts/commentary-network-test.ts && tsx scripts/commentary-perf-test.ts && tsx scripts/commentary-playtest.ts",
+    "test:physics": "tsx scripts/physics-reactor-test.ts",
+    "test:multiplayer-perf": "tsx scripts/multiplayer-client-perf-test.ts"
   },
   "dependencies": {
     "@dimforge/rapier3d-compat": "^0.20.0",
