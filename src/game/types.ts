@@ -130,6 +130,7 @@ export interface PlayerInfo {
   teamId: number;
   roles: Role[];
   ready: boolean;
+  connected: boolean;
 }
 
 export interface TeamInfo {
@@ -149,6 +150,7 @@ export interface RoomSnapshot {
   teams: TeamInfo[];
   startAt: number | null;
   round: number;
+  version: number;
   now: number;
   leaderId: string | null;
 }

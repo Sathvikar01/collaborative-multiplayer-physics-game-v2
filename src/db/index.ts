@@ -10,7 +10,11 @@ const globalForDb = globalThis as typeof globalThis & {
 function getPool(): Pool | null {
   if (!databaseUrl) return null;
   if (!globalForDb.__arenaNextJsPostgresqlPool) {
-    globalForDb.__arenaNextJsPostgresqlPool = new Pool({ connectionString: databaseUrl });
+    globalForDb.__arenaNextJsPostgresqlPool = new Pool({
+      connectionString: databaseUrl,
+      connectionTimeoutMillis: 5_000,
+      query_timeout: 5_000,
+    });
   }
   return globalForDb.__arenaNextJsPostgresqlPool;
 }

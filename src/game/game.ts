@@ -6,6 +6,7 @@ import { getLevel, type LevelDef, type PropDef, type ZoneDef } from "./levels";
 import { GameAudio } from "./audio";
 import type { Role, RoleInput, SquadSize } from "./types";
 import { makeSquadMixState, resolvePhysInputs, type SquadMixState } from "./squad";
+import { RemoteInputBuffer, normalizeRemoteInputs } from "./remoteInput";
 
 type R = typeof RAPIER_T;
 let RAPIER: R | null = null;
@@ -21,7 +22,17 @@ async function loadRapier(): Promise<R> {
 export interface Snap {
   t: number;
   p: number[];
+  /** Optional per-part linear/angular velocities for host takeover. */
+  v?: number[];
+  av?: number[];
   props: number[];
+  /** Optional prop motion tuples: id, linear xyz, angular xyz. */
+  propMotion?: number[];
+  moverT?: number;
+  checkpointIdx?: number;
+  delivered?: boolean;
+  running?: boolean;
+  finished?: boolean;
   yaw: number;
   pitch: number;
   timer: number;
@@ -211,7 +222,10 @@ class BodyView {
   }
 
   shout(text: string) {
-    if (this.bubble) this.parts[HEAD].remove(this.bubble);
+    if (this.bubble) {
+      this.parts[HEAD].remove(this.bubble);
+      disposeObject3D(this.bubble);
+    }
     this.bubble = makeTextSprite(text, "#ffffff", "#222222");
     this.bubble.position.set(0.35, 0.95, 0);
     this.bubble.scale.set(1.6, 0.5, 1);
@@ -220,10 +234,7 @@ class BodyView {
   }
 
   dispose() {
-    this.root.traverse((o) => {
-      if (o instanceof THREE.Mesh) o.geometry.dispose();
-    });
-    for (const m of this.materials) m.dispose();
+    disposeObject3D(this.root);
   }
 }
 
@@ -391,7 +402,7 @@ export class Game {
   teamId: number;
   teamColor: string;
   teamName = "Team";
-  remoteInputs: Partial<Record<Role, RoleInput>> = {};
+  private readonly remoteInputBuffer = new RemoteInputBuffer();
   localInputs: Partial<Record<Role, RoleInput>> = {};
   squadSize: SquadSize = 5;
   squadMix: SquadMixState = makeSquadMixState();
@@ -433,6 +444,7 @@ export class Game {
   water: THREE.Mesh | null = null;
   onSnapshot: ((s: Snap) => void) | null = null;
   onBodyEvent: ((ev: BodyEvent) => void) | null = null;
+  private readonly scheduledTimeouts = new Set<ReturnType<typeof setTimeout>>();
 
   static async create(opts: GameOptions) {
     const R = await loadRapier();
@@ -523,16 +535,41 @@ export class Game {
       const s = makeTextSprite(name, this.teamColor);
       s.position.copy(this.view.label.position);
       s.scale.copy(this.view.label.scale);
-      this.view.parts[HEAD].remove(this.view.label);
+      const previous = this.view.label;
+      this.view.parts[HEAD].remove(previous);
+      disposeObject3D(previous);
       this.view.label = s;
       this.view.parts[HEAD].add(s);
     }
   }
 
+  /** Keep local rendering/authority metadata in sync when the room reassigns a team. */
+  setTeamIdentity(teamId: number, color: string, name: string) {
+    const colorChanged = color !== this.teamColor;
+    this.teamId = teamId;
+    if (!colorChanged) {
+      this.setTeamName(name);
+      return;
+    }
+    const previous = this.view;
+    this.scene.remove(previous.root);
+    const next = new BodyView(color, false, name);
+    next.setTransforms(this.displayTransforms);
+    next.setFace(0, this.displayYaw, this.displayPitch, this.pelvisYawFromDisplay(), this.displayFallen, this.displayHolding > 0);
+    this.scene.add(next.root);
+    this.view = next;
+    this.teamColor = color;
+    this.teamName = name;
+    previous.dispose();
+  }
+
   /* ------------------------------- Level ------------------------------- */
   setLevel(levelId: string) {
+    this.cancelScheduledTimeouts();
     this.level = getLevel(levelId);
     // reset physics world entirely
+    if (this.body) this.body.dispose();
+    if (this.eventQueue) this.eventQueue.free();
     if (this.world) this.world.free();
     const R = this.R;
     this.world = new R.World({ x: 0, y: -9.81, z: 0 });
@@ -542,6 +579,7 @@ export class Game {
     this.staticBodies = [];
     this.nonGrabHandles.clear();
     this.props = [];
+    disposeObject3D(this.levelGroup);
     this.levelGroup.clear();
     this.checkpointMeshes = [];
     this.finishGate = null;
@@ -799,23 +837,79 @@ export class Game {
     if (isHost === this.isHost) return;
     this.isHost = isHost;
     if (isHost) {
-      // rebuild props with physics and spawn body at last known position
-      const last = this.ownBuffer[this.ownBuffer.length - 1]?.snap;
+      // Rebuild the Rapier world with authoritative state from the latest host
+      // snapshot. A checkpoint-only respawn loses props/objectives and causes a
+      // visible teleport whenever the old host disconnects.
+      const last = validateSnapshot(this.ownBuffer[this.ownBuffer.length - 1]?.snap);
       const yaw = last?.yaw ?? this.level.spawnYaw;
-      const pos = last ? new THREE.Vector3(last.p[0], last.p[1] - 1, last.p[2]) : new THREE.Vector3(...this.level.spawn);
-      const cp = this.level.checkpoints[this.checkpointIdx];
-      const spawn = cp?.spawn ? new THREE.Vector3(...cp.spawn) : pos;
-      const timer = last?.timer ?? this.timer;
-      const score = last?.score ?? this.score;
-      const wasRunning = this.running;
+      const wasRunning = last?.running ?? this.running;
       this.setLevel(this.level.id);
-      this.spawnBody(spawn, yaw);
-      this.timer = timer;
-      this.score = score;
+      this.spawnBody(new THREE.Vector3(...this.level.spawn), yaw);
+      if (last) this.restoreTakeoverSnapshot(last);
+      this.timer = last?.timer ?? this.timer;
+      this.score = last?.score ?? this.score;
       this.running = wasRunning;
+      this.finished = last?.finished ?? false;
+      this.frozen = !this.running;
+      if (this.body) this.body.frozen = this.frozen;
+      this.remoteInputBuffer.clear();
     } else {
       if (this.body) this.body.dispose();
       this.body = null;
+    }
+  }
+
+  private restoreTakeoverSnapshot(s: Snap) {
+    const body = this.body;
+    if (!body || !validTransforms(s.p)) return;
+    for (let i = 0; i < PART_COUNT; i++) {
+      const o = i * 7;
+      const q = normalizedQuat(s.p[o + 3], s.p[o + 4], s.p[o + 5], s.p[o + 6]);
+      if (!q) continue;
+      const rb = body.parts[i];
+      rb.setTranslation({ x: s.p[o], y: s.p[o + 1], z: s.p[o + 2] }, true);
+      rb.setRotation(q, true);
+      if (s.v && s.v.length === PART_COUNT * 3) rb.setLinvel({ x: s.v[i * 3], y: s.v[i * 3 + 1], z: s.v[i * 3 + 2] }, true);
+      if (s.av && s.av.length === PART_COUNT * 3) rb.setAngvel({ x: s.av[i * 3], y: s.av[i * 3 + 1], z: s.av[i * 3 + 2] }, true);
+    }
+    body.heading = s.yaw;
+    body.pelvisYaw = s.yaw;
+    body.headPitch = s.pitch;
+    body.fallen = s.fallen === 1;
+    body.writeTransforms(this.displayTransforms);
+    this.displayYaw = s.yaw;
+    this.displayPitch = s.pitch;
+    this.displayFallen = body.fallen;
+
+    const motion = new Map<number, number[]>();
+    if (s.propMotion) {
+      for (let i = 0; i + 6 < s.propMotion.length; i += 7) motion.set(s.propMotion[i], s.propMotion.slice(i + 1, i + 7));
+    }
+    for (let i = 0; i + 7 < s.props.length; i += 8) {
+      const p = this.props.find((x) => x.id === s.props[i]);
+      if (!p?.body) continue;
+      const q = normalizedQuat(s.props[i + 4], s.props[i + 5], s.props[i + 6], s.props[i + 7]);
+      if (!q) continue;
+      p.body.setTranslation({ x: s.props[i + 1], y: s.props[i + 2], z: s.props[i + 3] }, true);
+      p.body.setRotation(q, true);
+      const mv = motion.get(p.id);
+      if (mv) {
+        p.body.setLinvel({ x: mv[0], y: mv[1], z: mv[2] }, true);
+        p.body.setAngvel({ x: mv[3], y: mv[4], z: mv[5] }, true);
+      }
+    }
+    if (Number.isFinite(s.moverT)) this.moverT = s.moverT!;
+    if (Number.isInteger(s.checkpointIdx)) this.checkpointIdx = Math.max(-1, Math.min(this.level.checkpoints.length - 1, s.checkpointIdx!));
+    this.delivered = s.delivered === true;
+    for (const f of this.checkpointMeshes) (f.material as THREE.MeshStandardMaterial).color.set("#ffd23f");
+    for (let i = 0; i <= this.checkpointIdx; i++) (this.checkpointMeshes[i].material as THREE.MeshStandardMaterial).color.set("#6ef29a");
+    for (const m of this.movers) {
+      const off = Math.sin(this.moverT * m.speed + m.phase) * m.dist;
+      const x = m.base.x + (m.axis === "x" ? off : 0);
+      const z = m.base.z + (m.axis === "z" ? off : 0);
+      m.rb.setTranslation({ x, y: m.base.y, z }, true);
+      m.rb.setLinvel({ x: 0, y: 0, z: 0 }, true);
+      m.mesh.position.set(x, m.base.y, z);
     }
   }
 
@@ -845,11 +939,16 @@ export class Game {
   setLocalInput(role: Role, input: RoleInput) {
     this.localInputs[role] = input;
   }
-  setRemoteInputs(inputs: Partial<Record<Role, RoleInput>>) {
-    for (const k of Object.keys(inputs) as Role[]) this.remoteInputs[k] = inputs[k]!;
+  /** Refresh one player's lease; the one-argument form supports old relays. */
+  setRemoteInputs(playerId: string, inputs: unknown): void;
+  setRemoteInputs(inputs: Partial<Record<Role, RoleInput>>): void;
+  setRemoteInputs(playerIdOrInputs: string | Partial<Record<Role, RoleInput>>, maybeInputs?: unknown) {
+    const playerId = typeof playerIdOrInputs === "string" ? playerIdOrInputs : "__legacy__";
+    const inputs = typeof playerIdOrInputs === "string" ? maybeInputs : playerIdOrInputs;
+    this.remoteInputBuffer.set(playerId, normalizeRemoteInputs(inputs));
   }
-  clearRemoteInputs() {
-    this.remoteInputs = {};
+  clearRemoteInputs(playerId?: string) {
+    this.remoteInputBuffer.clear(playerId);
   }
 
   /* ------------------------------- Flow ------------------------------- */
@@ -910,6 +1009,20 @@ export class Game {
     p.cooldown = 0.5;
   }
 
+  private scheduleTimeout(fn: () => void, delay: number) {
+    const handle = setTimeout(() => {
+      this.scheduledTimeouts.delete(handle);
+      if (!this.disposed) fn();
+    }, delay);
+    this.scheduledTimeouts.add(handle);
+    return handle;
+  }
+
+  private cancelScheduledTimeouts() {
+    for (const handle of this.scheduledTimeouts) clearTimeout(handle);
+    this.scheduledTimeouts.clear();
+  }
+
   /* ------------------------------- Loop ------------------------------- */
   start() {
     this.lastFrame = performance.now();
@@ -927,7 +1040,8 @@ export class Game {
   private frame(dt: number) {
     if (this.isHost && this.body) {
       // merge squad inputs (3P/5P) into the 5 physics channels
-      const merged: Partial<Record<Role, RoleInput>> = { ...this.remoteInputs, ...this.localInputs };
+      // Expired remote leases become neutral input before they reach the mixer.
+      const merged: Partial<Record<Role, RoleInput>> = { ...this.remoteInputBuffer.getMerged(), ...this.localInputs };
       const phys = resolvePhysInputs(merged, this.squadSize, Math.min(dt, 0.1), this.squadMix);
       Object.assign(this.body.inputs, phys);
       this.accumulator += dt;
@@ -1144,7 +1258,7 @@ export class Game {
           this.handleLevelEvent({ type: "score", pos: [t.x, t.y, t.z] }, true);
           this.message(`BASKET! ${this.score} / ${L.targetScore}`, "good");
           p.cooldown = 1.5;
-          setTimeout(() => this.resetProp(p), 900);
+          this.scheduleTimeout(() => this.resetProp(p), 900);
           if (this.score >= (L.targetScore ?? 3)) this.finish();
         }
       }
@@ -1255,7 +1369,7 @@ export class Game {
       case "finish":
         a.fanfare();
         for (let i = 0; i < 6; i++)
-          setTimeout(() => this.particles.emit([ev.pos[0] + (Math.random() - 0.5) * 3, ev.pos[1] + 1.5, ev.pos[2] + (Math.random() - 0.5) * 3], 50, { color: ["#ff5d5d", "#4fa8ff", "#ffd23f", "#6ef29a", "#c58bff", "#ffffff"], speed: 3.5, up: 5, size: 0.1, life: 2.2, spread: 0.5 }), i * 180);
+          this.scheduleTimeout(() => this.particles.emit([ev.pos[0] + (Math.random() - 0.5) * 3, ev.pos[1] + 1.5, ev.pos[2] + (Math.random() - 0.5) * 3], 50, { color: ["#ff5d5d", "#4fa8ff", "#ffd23f", "#6ef29a", "#c58bff", "#ffffff"], speed: 3.5, up: 5, size: 0.1, life: 2.2, spread: 0.5 }), i * 180);
         break;
     }
     if (local) this.pendingEvents.push(ev);
@@ -1264,16 +1378,38 @@ export class Game {
   /* ------------------------------- Networking ------------------------------- */
   buildSnapshot(): Snap {
     const props: number[] = [];
+    const propMotion: number[] = [];
     for (const p of this.props) {
       if (!p.body) continue;
       const t = p.body.translation();
       const r = p.body.rotation();
       props.push(p.id, r3(t.x), r3(t.y), r3(t.z), r3(r.x), r3(r.y), r3(r.z), r3(r.w));
+      const v = p.body.linvel();
+      const av = p.body.angvel();
+      propMotion.push(p.id, r3(v.x), r3(v.y), r3(v.z), r3(av.x), r3(av.y), r3(av.z));
+    }
+    const v: number[] = [];
+    const av: number[] = [];
+    if (this.body) {
+      for (const part of this.body.parts) {
+        const lv = part.linvel();
+        const angular = part.angvel();
+        v.push(r3(lv.x), r3(lv.y), r3(lv.z));
+        av.push(r3(angular.x), r3(angular.y), r3(angular.z));
+      }
     }
     return {
       t: performance.now(),
       p: this.displayTransforms.map(r3),
+      v,
+      av,
       props,
+      propMotion,
+      moverT: this.moverT,
+      checkpointIdx: this.checkpointIdx,
+      delivered: this.delivered,
+      running: this.running,
+      finished: this.finished,
       yaw: this.displayYaw,
       pitch: this.displayPitch,
       timer: this.timer,
@@ -1285,7 +1421,9 @@ export class Game {
   }
 
   /** Snapshot from own team's host (when this client is not the host). */
-  applyOwnSnapshot(s: Snap) {
+  applyOwnSnapshot(raw: Snap) {
+    const s = validateSnapshot(raw);
+    if (!s) return;
     const now = performance.now();
     this.ownBuffer.push({ recv: now, snap: s });
     while (this.ownBuffer.length > 12) this.ownBuffer.shift();
@@ -1304,7 +1442,9 @@ export class Game {
     }
   }
 
-  applyGhostSnapshot(teamId: number, color: string, name: string, s: Snap) {
+  applyGhostSnapshot(teamId: number, color: string, name: string, raw: Snap) {
+    const s = validateSnapshot(raw);
+    if (!s) return;
     let g = this.ghosts.get(teamId);
     if (!g) {
       const view = new BodyView(color, true, name);
@@ -1425,17 +1565,100 @@ export class Game {
   dispose() {
     this.disposed = true;
     cancelAnimationFrame(this.raf);
+    this.cancelScheduledTimeouts();
+    this.remoteInputBuffer.clear();
     window.removeEventListener("resize", this.resize);
     this.audio.stopMusic();
     for (const id of [...this.ghosts.keys()]) this.removeGhost(id);
+    this.scene.remove(this.view.root);
     this.view.dispose();
+    disposeObject3D(this.scene);
     this.renderer.dispose();
     if (this.body) this.body.dispose();
+    this.eventQueue?.free();
     this.world?.free();
   }
 }
 
 const r3 = (x: number) => Math.round(x * 1000) / 1000;
+
+function disposeObject3D(root: THREE.Object3D) {
+  root.traverse((object) => {
+    const renderable = object as THREE.Object3D & { geometry?: THREE.BufferGeometry; material?: THREE.Material | THREE.Material[] };
+    renderable.geometry?.dispose();
+    const materials = Array.isArray(renderable.material) ? renderable.material : renderable.material ? [renderable.material] : [];
+    for (const material of materials) {
+      for (const value of Object.values(material)) if (value instanceof THREE.Texture) value.dispose();
+      material.dispose();
+    }
+  });
+}
+
+function normalizedQuat(x: number, y: number, z: number, w: number) {
+  const n = Math.hypot(x, y, z, w);
+  if (!Number.isFinite(n) || n < 1e-6 || n > 1e6) return null;
+  return { x: x / n, y: y / n, z: z / n, w: w / n };
+}
+
+function validTransforms(values: unknown): values is number[] {
+  if (!Array.isArray(values) || values.length !== PART_COUNT * 7) return false;
+  for (let i = 0; i < PART_COUNT; i++) {
+    const o = i * 7;
+    if (!values.slice(o, o + 3).every((n) => typeof n === "number" && Number.isFinite(n) && Math.abs(n) <= 1e6)) return false;
+    if (!normalizedQuat(values[o + 3], values[o + 4], values[o + 5], values[o + 6])) return false;
+  }
+  return true;
+}
+
+function validNumbers(values: unknown, length: number, limit: number): values is number[] {
+  return Array.isArray(values) && values.length === length && values.every((n) => typeof n === "number" && Number.isFinite(n) && Math.abs(n) <= limit);
+}
+
+/** Drop malformed or hostile snapshots before they touch rendering/physics. */
+function validateSnapshot(value: unknown): Snap | null {
+  if (!value || typeof value !== "object") return null;
+  const raw = value as Record<string, unknown>;
+  if (!validTransforms(raw.p) || !Array.isArray(raw.props) || raw.props.length % 8 !== 0) return null;
+  if (!validNumbers(raw.props, raw.props.length, 1e6)) return null;
+  for (let i = 0; i + 7 < raw.props.length; i += 8) {
+    if (!Number.isInteger(raw.props[i]) || !normalizedQuat(raw.props[i + 4], raw.props[i + 5], raw.props[i + 6], raw.props[i + 7])) return null;
+  }
+  if (!Array.isArray(raw.ev)) return null;
+  for (const event of raw.ev) {
+    if (!event || typeof event !== "object") return null;
+    const e = event as Record<string, unknown>;
+    if (typeof e.type !== "string" || !Array.isArray(e.pos) || e.pos.length !== 3 || !e.pos.every((n) => typeof n === "number" && Number.isFinite(n) && Math.abs(n) <= 1e6)) return null;
+  }
+  if (!["t", "yaw", "pitch", "timer", "fallen", "score"].every((k) => typeof raw[k] === "number" && Number.isFinite(raw[k]))) return null;
+  if (raw.fallen !== 0 && raw.fallen !== 1) return null;
+  if ((raw.timer as number) < 0 || (raw.timer as number) > 86400 || (raw.score as number) < 0 || (raw.score as number) > 1e6) return null;
+  if (raw.v !== undefined && !validNumbers(raw.v, PART_COUNT * 3, 1e5)) return null;
+  if (raw.av !== undefined && !validNumbers(raw.av, PART_COUNT * 3, 1e5)) return null;
+  if (raw.propMotion !== undefined && (!validNumbers(raw.propMotion, raw.propMotion instanceof Array ? raw.propMotion.length : -1, 1e5) || (raw.propMotion as number[]).length % 7 !== 0)) return null;
+  if (raw.moverT !== undefined && (typeof raw.moverT !== "number" || !Number.isFinite(raw.moverT) || Math.abs(raw.moverT) > 1e6)) return null;
+  if (raw.checkpointIdx !== undefined && (typeof raw.checkpointIdx !== "number" || !Number.isInteger(raw.checkpointIdx))) return null;
+  for (const key of ["delivered", "running", "finished"]) if (raw[key] !== undefined && typeof raw[key] !== "boolean") return null;
+  return {
+    t: raw.t as number,
+    p: [...raw.p],
+    v: raw.v ? [...(raw.v as number[])] : undefined,
+    av: raw.av ? [...(raw.av as number[])] : undefined,
+    props: [...raw.props],
+    propMotion: raw.propMotion ? [...(raw.propMotion as number[])] : undefined,
+    moverT: raw.moverT as number | undefined,
+    checkpointIdx: raw.checkpointIdx as number | undefined,
+    delivered: raw.delivered as boolean | undefined,
+    running: raw.running as boolean | undefined,
+    finished: raw.finished as boolean | undefined,
+    yaw: Math.max(-Math.PI, Math.min(Math.PI, raw.yaw as number)),
+    pitch: Math.max(-0.9, Math.min(0.7, raw.pitch as number)),
+    timer: raw.timer as number,
+    fallen: raw.fallen as number,
+    score: raw.score as number,
+    ev: raw.ev as Snap["ev"],
+    msg: typeof raw.msg === "string" && raw.msg.length <= 512 ? raw.msg : undefined,
+  };
+}
 
 function inZone(p: THREE.Vector3, z: ZoneDef) {
   return Math.abs(p.x - z.pos[0]) <= z.size[0] / 2 && Math.abs(p.y - z.pos[1]) <= z.size[1] / 2 && Math.abs(p.z - z.pos[2]) <= z.size[2] / 2;

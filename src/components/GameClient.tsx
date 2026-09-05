@@ -22,14 +22,30 @@ interface Toast {
   tone: "good" | "bad" | "info";
 }
 
+function secureId() {
+  if (typeof globalThis.crypto?.randomUUID === "function") return globalThis.crypto.randomUUID();
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 function getIds() {
   let pid = sessionStorage.getItem("mh_pid");
   if (!pid) {
-    pid = Math.random().toString(36).slice(2, 10);
+    pid = secureId();
     sessionStorage.setItem("mh_pid", pid);
   }
-  const name = localStorage.getItem("mh_name") || `Player${Math.floor(Math.random() * 90 + 10)}`;
-  return { pid, name };
+  let sessionToken = sessionStorage.getItem("mh_session");
+  if (!sessionToken) {
+    sessionToken = `${secureId()}${secureId()}`;
+    sessionStorage.setItem("mh_session", sessionToken);
+  }
+  let name = localStorage.getItem("mh_name");
+  if (!name) {
+    name = `Player${Math.floor(Math.random() * 90 + 10)}`;
+    localStorage.setItem("mh_name", name);
+  }
+  return { pid, sessionToken, name };
 }
 
 export default function GameClient({ code, solo }: { code: string; solo: boolean }) {
@@ -38,16 +54,21 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
   const netRef = useRef<Net | null>(null);
   const inputRef = useRef<InputManager | null>(null);
   const roomRef = useRef<RoomSnapshot | null>(null);
-  const meRef = useRef<{ pid: string; name: string } | null>(null);
   const goTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const uiTimersRef = useRef(new Set<ReturnType<typeof setTimeout>>());
   const lastSentRef = useRef<Record<string, RoleInput>>({});
   const lastSendTimeRef = useRef(0);
   const activeRoleRef = useRef(0);
   const creatingRef = useRef(false);
   const phaseRef = useRef<string>("");
   const roundRef = useRef(-1);
+  const sessionGenerationRef = useRef(0);
+  const roomVersionRef = useRef(-1);
+  const serverIdRef = useRef<string | null>(null);
+  const stateSeqRef = useRef(new Map<number, { authority: string; seq: number }>());
   const toastId = useRef(0);
 
+  const [identity] = useState(getIds);
   const [room, setRoom] = useState<RoomSnapshot | null>(null);
   const [hud, setHud] = useState<HudState | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -56,26 +77,35 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
   const [leaderboard, setLeaderboard] = useState<ScoreRow[]>([]);
   const [boardSquad, setBoardSquad] = useState<SquadSize>(5);
   const [muted, setMuted] = useState(false);
-  const [ready, setReady] = useState(false);
   const [gameReady, setGameReady] = useState(false);
   const [connErr, setConnErr] = useState(false);
   const [pointerLocked, setPointerLocked] = useState(false);
   const [finishToast, setFinishToast] = useState<{ team: string; time: number; color: string } | null>(null);
   const [myFinish, setMyFinish] = useState<number | null>(null);
 
-  const me = useMemo(() => room?.players.find((p) => p.id === meRef.current?.pid) ?? null, [room]);
+  const me = useMemo(() => room?.players.find((p) => p.id === identity.pid) ?? null, [room, identity.pid]);
   const myTeam = useMemo(() => room?.teams.find((t) => t.id === me?.teamId) ?? null, [room, me]);
   const isLeader = !!room && !!me && room.leaderId === me.id;
   const isHost = !!myTeam && !!me && myTeam.hostId === me.id;
   const myRoles = me?.roles ?? [];
+  const ready = me?.ready ?? false;
   const currentRole: Role | null = myRoles[Math.min(activeRole, Math.max(0, myRoles.length - 1))] ?? null;
   const challenge = CHALLENGES.find((c) => c.id === room?.challengeId) ?? CHALLENGES[0];
+
+  const scheduleUiTimeout = useCallback((fn: () => void, delay: number) => {
+    const timer = setTimeout(() => {
+      uiTimersRef.current.delete(timer);
+      fn();
+    }, delay);
+    uiTimersRef.current.add(timer);
+    return timer;
+  }, []);
 
   const addToast = useCallback((text: string, tone: Toast["tone"] = "info") => {
     const id = ++toastId.current;
     setToasts((t) => [...t.slice(-3), { id, text, tone }]);
-    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 2600);
-  }, []);
+    scheduleUiTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 2600);
+  }, [scheduleUiTimeout]);
 
   const ensureAudio = useCallback(() => {
     const g = gameRef.current;
@@ -86,24 +116,63 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
 
   // ---------- networking ----------
   useEffect(() => {
-    const ids = getIds();
-    meRef.current = ids;
-    const net = new Net(code, ids.pid, ids.name, solo);
+    const generation = ++sessionGenerationRef.current;
+    roomRef.current = null;
+    roomVersionRef.current = -1;
+    stateSeqRef.current.clear();
+    phaseRef.current = "";
+    roundRef.current = -1;
+    lastSentRef.current = {};
+    lastSendTimeRef.current = 0;
+    creatingRef.current = false;
+    queueMicrotask(() => {
+      if (sessionGenerationRef.current !== generation) return;
+      setRoom(null);
+      setGameReady(false);
+      setConnErr(false);
+      setCountdown(null);
+      setMyFinish(null);
+    });
+    const ids = identity;
+    const net = new Net(code, ids.pid, ids.sessionToken, ids.name, solo);
     netRef.current = net;
+    net.on("hello", (d) => {
+      if (sessionGenerationRef.current !== generation) return;
+      const hello = d as { serverId?: string };
+      if (!hello?.serverId) return;
+      if (serverIdRef.current && serverIdRef.current !== hello.serverId) {
+        roomVersionRef.current = -1;
+        stateSeqRef.current.clear();
+        roomRef.current = null;
+        setRoom(null);
+      }
+      serverIdRef.current = hello.serverId;
+    });
     net.on("room", (d) => {
       const r = d as RoomSnapshot;
+      if (sessionGenerationRef.current !== generation || !r || typeof r.version !== "number" || r.version <= roomVersionRef.current) return;
+      roomVersionRef.current = r.version;
       roomRef.current = r;
       setRoom(r);
     });
     net.on("input", (d) => {
-      const m = d as { inputs: Partial<Record<Role, RoleInput>> };
-      gameRef.current?.setRemoteInputs(m.inputs);
+      if (sessionGenerationRef.current !== generation) return;
+      const m = d as { playerId?: string; inputs?: Partial<Record<Role, RoleInput>> };
+      if (m.playerId && m.inputs) gameRef.current?.setRemoteInputs(m.playerId, m.inputs);
     });
     net.on("state", (d) => {
-      const m = d as { teamId: number; state: Snap };
+      if (sessionGenerationRef.current !== generation) return;
+      const m = d as { teamId: number; hostId?: string; epoch?: number; state: Snap; seq?: number; round?: number };
       const g = gameRef.current;
       const r = roomRef.current;
       if (!g || !r) return;
+      if (m.round !== undefined && m.round !== r.round) return;
+      if (typeof m.seq === "number") {
+        const authority = `${m.hostId ?? "unknown"}:${m.epoch ?? 0}`;
+        const last = stateSeqRef.current.get(m.teamId);
+        if (!Number.isSafeInteger(m.seq) || (last?.authority === authority && m.seq <= last.seq)) return;
+        stateSeqRef.current.set(m.teamId, { authority, seq: m.seq });
+      }
       const myT = r.players.find((p) => p.id === ids.pid)?.teamId;
       if (m.teamId === myT) {
         if (!g.isHost) g.applyOwnSnapshot(m.state);
@@ -113,15 +182,28 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
       }
     });
     net.on("finished", (d) => {
-      const m = d as { teamId: number; timeMs: number; teamName: string };
+      if (sessionGenerationRef.current !== generation) return;
+      const m = d as { teamId: number; timeMs: number; teamName: string; round?: number };
+      if (m.round !== undefined && m.round !== roomRef.current?.round) return;
       const t = roomRef.current?.teams.find((x) => x.id === m.teamId);
       const myT = roomRef.current?.players.find((p) => p.id === ids.pid)?.teamId;
       if (m.teamId === myT) setMyFinish(m.timeMs);
       setFinishToast({ team: m.teamName, time: m.timeMs, color: t?.color ?? "#fff" });
-      setTimeout(() => setFinishToast(null), 3500);
+      scheduleUiTimeout(() => setFinishToast(null), 3500);
     });
-    net.on("error", () => setConnErr(true));
+    net.on("error", (detail) => {
+      if (sessionGenerationRef.current !== generation) return;
+      const problem = detail as { kind?: string; status?: number; type?: string } | null;
+      if (!problem || problem.kind === "fetch") setConnErr(true);
+      else if (problem.kind === "http" && problem.status === 401) {
+        setConnErr(true);
+        if (problem.type !== "heartbeat") addToast("Session interrupted — retrying…", "bad");
+      } else if (problem.kind === "delivery-expired") {
+        addToast("An action could not be delivered. Please try again.", "bad");
+      }
+    });
     net.on("open", () => setConnErr(false));
+    net.on("request-ok", () => setConnErr(false));
     net.connect();
     const input = new InputManager();
     inputRef.current = input;
@@ -137,21 +219,32 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
     const onPL = () => setPointerLocked(document.pointerLockElement === canvasRef.current);
     document.addEventListener("pointerlockchange", onPL);
     const beforeUnload = () => net.close();
+    const uiTimers = uiTimersRef.current;
     window.addEventListener("beforeunload", beforeUnload);
     return () => {
+      sessionGenerationRef.current = generation + 1;
       window.removeEventListener("beforeunload", beforeUnload);
       document.removeEventListener("pointerlockchange", onPL);
       net.close();
       input.detach();
       gameRef.current?.dispose();
       gameRef.current = null;
+      if (netRef.current === net) netRef.current = null;
+      if (inputRef.current === input) inputRef.current = null;
+      roomRef.current = null;
+      if (goTimerRef.current) clearTimeout(goTimerRef.current);
+      goTimerRef.current = null;
+      for (const timer of uiTimers) clearTimeout(timer);
+      uiTimers.clear();
     };
-  }, [code, solo]);
+  }, [code, solo, identity, addToast, scheduleUiTimeout]);
 
   // ---------- create game when room + canvas are ready ----------
   useEffect(() => {
     if (!room || !me || !myTeam || gameRef.current || creatingRef.current || !canvasRef.current) return;
     creatingRef.current = true;
+    const generation = sessionGenerationRef.current;
+    const expectedNet = netRef.current;
     const canvas = canvasRef.current;
     const host = myTeam.hostId === me.id;
     (async () => {
@@ -164,24 +257,20 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
         isHost: host,
         squadSize: room.squadSize,
         onEvent: (ev) => {
+          if (sessionGenerationRef.current !== generation || netRef.current !== expectedNet) return;
           if (ev.type === "hud") setHud(ev.hud);
           else if (ev.type === "message") addToast(ev.text, ev.tone);
           else if (ev.type === "finish") {
             setMyFinish(ev.timeMs);
             const r = roomRef.current;
-            const meNow = r?.players.find((p) => p.id === meRef.current?.pid);
-            const team = r?.teams.find((t) => t.id === meNow?.teamId);
-            netRef.current?.send("finish", { timeMs: ev.timeMs });
-            if (r && team) {
-              void fetch("/api/leaderboard", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ challengeId: r.challengeId, squadSize: r.squadSize, teamName: team.name, players: r.players.filter((p) => p.teamId === team.id).map((p) => p.name), timeMs: ev.timeMs, roomCode: r.code }),
-              });
-            }
+            if (r) netRef.current?.send("finish", { timeMs: ev.timeMs, round: r.round });
           }
         },
       });
+      if (sessionGenerationRef.current !== generation || netRef.current !== expectedNet) {
+        g.dispose();
+        return;
+      }
       g.setTeamName(myTeam.name);
       g.onSnapshot = (s) => {
         const r = roomRef.current;
@@ -192,6 +281,7 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
       setGameReady(true);
       creatingRef.current = false;
     })().catch((e) => {
+      if (sessionGenerationRef.current !== generation || netRef.current !== expectedNet) return;
       console.error(e);
       creatingRef.current = false;
       addToast("Failed to start 3D engine (WebGL required)", "bad");
@@ -202,7 +292,7 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
   useEffect(() => {
     const g = gameRef.current;
     if (!g || !room || !me || !myTeam) return;
-    g.setTeamName(myTeam.name);
+    g.setTeamIdentity(myTeam.id, myTeam.color, myTeam.name);
     g.setHost(myTeam.hostId === me.id);
     g.squadSize = room.squadSize;
     g.clearRemoteInputs();
@@ -222,11 +312,15 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
       if (goTimerRef.current) clearTimeout(goTimerRef.current);
       if (room.phase === "lobby") {
         g.freeRoam();
-        setCountdown(null);
-        setMyFinish(null);
-        setReady(false);
+        queueMicrotask(() => {
+          if (phaseRef.current !== phaseKey) return;
+          setCountdown(null);
+          setMyFinish(null);
+        });
       } else if (room.phase === "countdown") {
-        setMyFinish(null);
+        queueMicrotask(() => {
+          if (phaseRef.current === phaseKey) setMyFinish(null);
+        });
         g.prepareRun();
         if (inputRef.current) {
           inputRef.current.yaw = g.level.spawnYaw;
@@ -241,7 +335,7 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
             setCountdown(0);
             g.go();
             g.audio.beep(true);
-            setTimeout(() => setCountdown(null), 900);
+            scheduleUiTimeout(() => setCountdown(null), 900);
             return;
           }
           const n = Math.ceil(remaining / 1000);
@@ -251,7 +345,7 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
           });
           goTimerRef.current = setTimeout(tick, Math.min(remaining, ((remaining - 1) % 1000) + 1));
         };
-        tick();
+        goTimerRef.current = setTimeout(tick, 0);
       } else if (room.phase === "playing") {
         if (!g.running && !g.finished && roundRef.current !== room.round) {
           // joined mid-round or missed countdown
@@ -261,17 +355,28 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
         roundRef.current = room.round;
       } else if (room.phase === "results") {
         g.stopRun();
-        setCountdown(null);
         g.audio.stopMusic();
-        setBoardSquad(room.squadSize);
-        void fetch(`/api/leaderboard?challenge=${room.challengeId}&squad=${room.squadSize}`)
-          .then((r) => r.json())
-          .then((d) => setLeaderboard(d.rows ?? []))
-          .catch(() => {});
+        queueMicrotask(() => {
+          if (phaseRef.current !== phaseKey) return;
+          setCountdown(null);
+          setBoardSquad(room.squadSize);
+        });
+        const loadLeaderboard = () => {
+          void fetch(`/api/leaderboard?challenge=${room.challengeId}&squad=${room.squadSize}`)
+            .then((r) => r.json())
+            .then((d) => {
+              if (phaseRef.current === phaseKey) setLeaderboard(d.rows ?? []);
+            })
+            .catch(() => {});
+        };
+        loadLeaderboard();
+        // Score persistence runs after the finish response so it cannot stall
+        // the live command queue; refresh once after that background write.
+        scheduleUiTimeout(loadLeaderboard, 1500);
       }
     }
     if (room.phase === "countdown" || room.phase === "playing") roundRef.current = room.round;
-  }, [room, me, myTeam, gameReady, ensureAudio]);
+  }, [room, me, myTeam, gameReady, ensureAudio, scheduleUiTimeout]);
 
   // ---------- input loop ----------
   useEffect(() => {
@@ -284,7 +389,7 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
       const g = gameRef.current;
       const input = inputRef.current;
       const r = roomRef.current;
-      const pid = meRef.current?.pid;
+      const pid = identity.pid;
       if (!g || !input || !r || !pid) return;
       const meNow = r.players.find((p) => p.id === pid);
       if (!meNow) return;
@@ -315,7 +420,7 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
-  }, []);
+  }, [identity.pid]);
 
   useEffect(() => {
     gameRef.current?.audio.setMuted(muted);
@@ -326,7 +431,6 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
   const toggleReady = () => {
     ensureAudio();
     const next = !ready;
-    setReady(next);
     send("ready", { ready: next });
   };
   const onCanvasClick = () => {
@@ -334,7 +438,7 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
     if ((myRoles.includes("torso") || myRoles.includes("head")) && room?.phase !== "lobby") inputRef.current?.requestPointerLock();
   };
 
-  const allReady = !!room && room.players.length > 0 && room.players.every((p) => p.ready);
+  const allReady = !!room && room.players.length > 0 && room.players.every((p) => p.connected && p.ready);
   const phase = room?.phase ?? "lobby";
   const sortedTeams = room ? [...room.teams].sort((a, b) => (a.finishMs ?? 1e12) - (b.finishMs ?? 1e12)) : [];
   const level = room ? getLevel(room.challengeId) : null;
@@ -350,6 +454,12 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
             MANY <span className="text-[#ffd23f]">HANDS</span>
           </div>
           <div className="text-white/60 animate-pulse">{connErr ? "Reconnecting…" : "Loading physics & shaders…"}</div>
+        </div>
+      )}
+
+      {connErr && room && (
+        <div className="pointer-events-none absolute left-1/2 top-16 z-40 -translate-x-1/2 rounded-xl border border-[#ffd23f]/40 bg-black/80 px-4 py-2 text-center text-sm font-bold shadow-xl backdrop-blur">
+          Reconnecting… controls are buffered safely and stale inputs will be released.
         </div>
       )}
 
@@ -570,7 +680,7 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
                     <span className="h-3 w-3 rounded-full" style={{ background: t.color }} />
                     <span className="font-black">{t.name}</span>
                     <span className="text-xs text-white/50">
-                      {members.length}/{room.squadSize}
+                      {members.filter((m) => m.connected).length}/{members.length} online · {members.length}/{room.squadSize}
                     </span>
                   </div>
                   {!mine && members.length < room.squadSize && (
@@ -601,10 +711,10 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
                 </div>
                 <div className="mt-2 flex flex-wrap gap-1">
                   {members.map((m) => (
-                    <span key={m.id} className={`rounded-full px-2 py-0.5 text-[11px] ${m.ready ? "bg-[#6ef29a] text-black" : "bg-white/10"}`}>
+                    <span key={m.id} className={`rounded-full px-2 py-0.5 text-[11px] ${!m.connected ? "bg-[#ffd23f]/20 text-[#ffd23f]" : m.ready ? "bg-[#6ef29a] text-black" : "bg-white/10"}`}>
                       {m.name}
                       {m.id === t.hostId ? " ★" : ""}
-                      {m.ready ? " ✓" : ""}
+                      {!m.connected ? " · reconnecting" : m.ready ? " ✓" : ""}
                     </span>
                   ))}
                 </div>

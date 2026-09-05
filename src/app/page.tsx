@@ -13,8 +13,9 @@ interface ScoreRow {
 
 function makeCode() {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const random = crypto.getRandomValues(new Uint8Array(4));
   let c = "";
-  for (let i = 0; i < 4; i++) c += chars[Math.floor(Math.random() * chars.length)];
+  for (const value of random) c += chars[value % chars.length];
   return c;
 }
 
@@ -27,7 +28,8 @@ export default function Home() {
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
-    setName(localStorage.getItem("mh_name") ?? "");
+    const frame = requestAnimationFrame(() => setName(localStorage.getItem("mh_name") ?? ""));
+    return () => cancelAnimationFrame(frame);
   }, []);
   useEffect(() => {
     for (const c of CHALLENGES) {
@@ -50,7 +52,7 @@ export default function Home() {
   };
   const join = () => {
     const c = code.trim().toUpperCase();
-    if (c.length < 3) return;
+    if (!/^[A-HJ-NP-Z2-9]{4}$/.test(c)) return;
     saveName();
     setBusy(true);
     router.push(`/play/${c}`);
@@ -75,8 +77,8 @@ export default function Home() {
         </header>
 
         <div className="mt-10 grid gap-4 md:grid-cols-5">
-          {ROLES_5.map((r) => (
-            <div key={r} className="float rounded-2xl bg-white/5 p-4 text-center border border-white/10" style={{ animationDelay: `${Math.random() * 2}s` }}>
+          {ROLES_5.map((r, index) => (
+            <div key={r} className="float rounded-2xl bg-white/5 p-4 text-center border border-white/10" style={{ animationDelay: `${(index * 0.37).toFixed(2)}s` }}>
               <div className="text-4xl">{ROLE_INFO[r].emoji}</div>
               <div className="mt-1 font-black">{ROLE_INFO[r].label}</div>
               <div className="mt-1 text-xs text-white/60">{ROLE_INFO[r].blurb}</div>
@@ -107,9 +109,9 @@ export default function Home() {
             <div className="mt-5 flex gap-2">
               <input
                 value={code}
-                onChange={(e) => setCode(e.target.value.toUpperCase())}
+                onChange={(e) => setCode(e.target.value.toUpperCase().replace(/[^A-HJ-NP-Z2-9]/g, ""))}
                 onKeyDown={(e) => e.key === "Enter" && join()}
-                maxLength={6}
+                maxLength={4}
                 placeholder="ROOM CODE"
                 className="w-full rounded-xl bg-black/40 px-4 py-3 text-lg font-black tracking-[0.3em] outline-none ring-[#4fa8ff] focus:ring-2"
               />

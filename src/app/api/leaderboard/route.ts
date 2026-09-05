@@ -6,15 +6,35 @@ import { CHALLENGES } from "@/game/types";
 
 export const dynamic = "force-dynamic";
 
-function squadOf(v: string | null): 3 | 5 {
-  return v === "3" ? 3 : 5;
+function parseChallenge(v: string | null): string | null {
+  if (v == null) return CHALLENGES[0].id;
+  return CHALLENGES.some((challenge) => challenge.id === v) ? v : null;
+}
+
+function parseSquad(v: string | null): 3 | 5 | null {
+  if (v == null || v === "5") return 5;
+  if (v === "3") return 3;
+  return null;
+}
+
+function parseLimit(v: string | null): number | null {
+  if (v == null) return 10;
+  // Do not let Number() silently accept decimals, signs, whitespace, NaN, or
+  // infinities. A bounded positive integer is the only valid limit.
+  if (!/^[1-9]\d*$/.test(v)) return null;
+  const limit = Number(v);
+  return Number.isSafeInteger(limit) && limit <= 50 ? limit : null;
 }
 
 export async function GET(req: Request) {
   const url = new URL(req.url);
-  const challengeId = url.searchParams.get("challenge") ?? CHALLENGES[0].id;
-  const squad = squadOf(url.searchParams.get("squad"));
-  const limit = Math.min(50, Number(url.searchParams.get("limit") ?? 10));
+  const challengeId = parseChallenge(url.searchParams.get("challenge"));
+  const squad = parseSquad(url.searchParams.get("squad"));
+  const limit = parseLimit(url.searchParams.get("limit"));
+  if (!challengeId) return NextResponse.json({ error: "unsupported challenge" }, { status: 400 });
+  if (!squad) return NextResponse.json({ error: "squad must be 3 or 5" }, { status: 400 });
+  if (!limit) return NextResponse.json({ error: "limit must be an integer between 1 and 50" }, { status: 400 });
+
   try {
     // Legacy rows predate squad_size (NULL) — count them as 5P.
     const squadFilter = squad === 3 ? eq(scores.squadSize, 3) : or(eq(scores.squadSize, 5), isNull(scores.squadSize));
@@ -25,51 +45,16 @@ export async function GET(req: Request) {
       .orderBy(asc(scores.timeMs), asc(scores.createdAt))
       .limit(limit);
     return NextResponse.json({ challengeId, squad, rows });
-  } catch (e) {
-    // tolerant fallback if the squad_size column hasn't been migrated yet
-    try {
-      const rows = await db
-        .select()
-        .from(scores)
-        .where(eq(scores.challengeId, challengeId))
-        .orderBy(asc(scores.timeMs), asc(scores.createdAt))
-        .limit(limit);
-      return NextResponse.json({ challengeId, squad, rows });
-    } catch (e2) {
-      return NextResponse.json({ challengeId, squad, rows: [], error: String(e2 ?? e) }, { status: 200 });
-    }
+  } catch {
+    // Do not expose connection details, SQL, or schema information to clients.
+    return NextResponse.json({ error: "leaderboard unavailable" }, { status: 503 });
   }
 }
 
 export async function POST(req: Request) {
-  try {
-    const body = (await req.json()) as { challengeId?: string; teamName?: string; players?: string[]; timeMs?: number; roomCode?: string; squadSize?: number };
-    if (!body.challengeId || !CHALLENGES.some((c) => c.id === body.challengeId)) return NextResponse.json({ error: "bad challenge" }, { status: 400 });
-    const timeMs = Math.round(Number(body.timeMs));
-    if (!Number.isFinite(timeMs) || timeMs < 1000 || timeMs > 3_600_000) return NextResponse.json({ error: "bad time" }, { status: 400 });
-    const squadSize = body.squadSize === 3 ? 3 : 5;
-    const players = Array.isArray(body.players) ? body.players.map((p) => String(p).slice(0, 16)).slice(0, 5) : [];
-    const values = {
-      challengeId: body.challengeId,
-      teamName: String(body.teamName ?? "Team").slice(0, 24),
-      players,
-      timeMs,
-      roomCode: body.roomCode ? String(body.roomCode).slice(0, 8) : null,
-      squadSize,
-    };
-    let row;
-    try {
-      [row] = await db.insert(scores).values(values).returning();
-    } catch {
-      // column missing pre-migration: insert without squadSize
-      const { squadSize: _drop, ...legacy } = values;
-      [row] = await db.insert(scores).values(legacy).returning();
-    }
-    // compute rank
-    const better = await db.select({ id: scores.id }).from(scores).where(eq(scores.challengeId, body.challengeId));
-    const rank = better.length; // placeholder; refined client side
-    return NextResponse.json({ row, rank });
-  } catch (e) {
-    return NextResponse.json({ error: String(e) }, { status: 500 });
-  }
+  void req;
+  return NextResponse.json(
+    { error: "direct leaderboard writes are disabled; scores are recorded when a room finishes" },
+    { status: 405, headers: { Allow: "GET" } },
+  );
 }
