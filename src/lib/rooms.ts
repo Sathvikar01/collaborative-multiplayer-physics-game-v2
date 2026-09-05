@@ -199,13 +199,11 @@ export function setRole(room: Room, playerId: string, role: Role) {
 }
 export function setSquadSize(room: Room, squad: SquadSize) {
   if (room.phase !== "lobby" || (squad !== 3 && squad !== 5) || room.squadSize === squad) return false;
-  if (room.teams.some((team) => room.players.filter((player) => player.teamId === team.id).length > squad)) return false;
   room.squadSize = squad;
   for (const pl of room.players) { pl.roles = []; pl.ready = false; }
   for (const t of room.teams) {
-    const members = room.players.filter((x) => x.teamId === t.id);
-    const seats = squadRoles(squad);
-    members.forEach((member, index) => { member.roles = seats[index] ? [seats[index]] : []; });
+    const first = room.players.find((x) => x.teamId === t.id);
+    if (first) first.roles = [squadRoles(squad)[0]];
   }
   changed(room); return true;
 }

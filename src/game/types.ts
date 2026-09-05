@@ -1,12 +1,11 @@
 export const PHYS_ROLES = ["head", "lhand", "rhand", "torso", "lleg", "rleg"] as const;
 export type PhysRole = (typeof PHYS_ROLES)[number];
 
-// Stable transport-seat IDs retained for room/reconnect compatibility. Gameplay
-// treats every occupied seat as a universal crew controller.
+// Squad roles players actually pick. 3-player: arms+torso+legs. 5-player: split hands + split legs.
 export const ROLES_3 = ["arms", "torso", "legs"] as const;
 export const ROLES_5 = ["lhand", "rhand", "torso", "lleg", "rleg"] as const;
 export type SquadSize = 3 | 5;
-// Union of every transport seat (legacy head kept for old rooms).
+// Union of every assignable role (legacy head kept for old rooms).
 export const ROLES = ["arms", "torso", "legs", "lhand", "rhand", "lleg", "rleg", "head"] as const;
 export type Role = (typeof ROLES)[number];
 
@@ -14,7 +13,6 @@ export function squadRoles(squad: SquadSize): readonly Role[] {
   return squad === 3 ? ROLES_3 : ROLES_5;
 }
 
-/** Legacy body-part metadata retained only for old room payloads. */
 export const ROLE_INFO: Record<Role, { label: string; short: string; emoji: string; blurb: string; keys: { key: string; does: string }[] }> = {
   head: {
     label: "Head & Eyes (legacy)",
@@ -51,10 +49,10 @@ export const ROLE_INFO: Record<Role, { label: string; short: string; emoji: stri
     label: "Left Hand",
     short: "L HAND",
     emoji: "🤚",
-    blurb: "Own the left hand. Align with the right hand to share heavy loads; fighting it twists or drops them.",
+    blurb: "Own the left hand. BOTH hands must hold Space to two-hand grab; Q grabs left alone.",
     keys: [
-      { key: "W S", does: "Raise / lower your hand independently" },
-      { key: "A D", does: "Swing — mismatch twists the load" },
+      { key: "W S", does: "Raise / lower (averages with right hand)" },
+      { key: "A D", does: "Swing (averages with right hand)" },
       { key: "Space", does: "Two-hand grab (needs BOTH players)" },
       { key: "Q", does: "Grab left hand alone" },
       { key: "Shift", does: "THROW (needs BOTH players)" },
@@ -64,10 +62,10 @@ export const ROLE_INFO: Record<Role, { label: string; short: string; emoji: stri
     label: "Right Hand",
     short: "R HAND",
     emoji: "✋",
-    blurb: "Own the right hand. Align with the left hand to share heavy loads; fighting it twists or drops them.",
+    blurb: "Own the right hand. BOTH hands must hold Space to two-hand grab; E grabs right alone.",
     keys: [
-      { key: "W S", does: "Raise / lower your hand independently" },
-      { key: "A D", does: "Swing — mismatch twists the load" },
+      { key: "W S", does: "Raise / lower (averages with right hand)" },
+      { key: "A D", does: "Swing (averages with right hand)" },
       { key: "Space", does: "Two-hand grab (needs BOTH players)" },
       { key: "E", does: "Grab right hand alone" },
       { key: "Shift", does: "THROW (needs BOTH players)" },

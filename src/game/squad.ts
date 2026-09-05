@@ -1,149 +1,89 @@
-import { emptyInput, ROLES, type Role, type RoleInput, type SquadSize } from "./types";
+import { emptyInput, type Role, type RoleInput, type SquadSize } from "./types";
 import type { BodyInputs } from "./body";
 import { normalizeRemoteInputs } from "./remoteInput";
 
 export interface SquadMixState {
   legT: number;
-  /** Shared body heading. Game seeds this from the authoritative body. */
-  heading: number;
 }
 
-const TURN_SPEED = 2.2;
-const STEP_SECONDS = 0.28;
+/** Fresh per-run mixer state (3P auto-alternate legs). */
+export const makeSquadMixState = (): SquadMixState => ({ legT: 0 });
 
-/** Fresh per-run state for the shared heading and automatic gait. */
-export const makeSquadMixState = (): SquadMixState => ({
-  legT: 0,
-  heading: 0,
-});
-
-const averageAxes = (inputs: readonly RoleInput[]): [number, number] => {
-  if (inputs.length === 0) return [0, 0];
-  let f = 0;
-  let s = 0;
-  for (const input of inputs) {
-    f += input.f;
-    s += input.s;
-  }
-  return [f / inputs.length, s / inputs.length];
-};
-
-const wrapAngle = (angle: number): number => {
-  while (angle > Math.PI) angle -= Math.PI * 2;
-  while (angle < -Math.PI) angle += Math.PI * 2;
-  return angle;
-};
+const get = (ext: Partial<Record<Role, RoleInput>>, role: Role): RoleInput => ext[role] ?? emptyInput();
 
 /**
- * Merge transport-seat inputs into the six physical channels. Role names are
- * deliberately ignored here: every occupied seat has the same useful controls.
- * Q/E temporarily turn that player's WASD into left/right hand aim, while all
- * remaining non-neutral players vote on shared locomotion.
+ * Match singularity2's role controls while retaining separate internal hand
+ * channels for this repo's grip diagnostics and takeover state.
+ * - Camera/heading follows Torso's mouse (legacy Head falls back).
+ * - 5P hand raise/swing is averaged; Space/Shift require both players.
+ * - Q/E still grab one hand alone.
+ * - 3P Legs auto-alternates while a direction is held.
  */
 export function resolvePhysInputs(
   ext: Partial<Record<Role, RoleInput>>,
-  _squad: SquadSize,
+  squad: SquadSize,
   dt: number,
-  st: SquadMixState,
+  state: SquadMixState,
 ): BodyInputs {
   const safe = normalizeRemoteInputs(ext);
-  const frameDt = Number.isFinite(dt) ? Math.max(0, Math.min(dt, 0.1)) : 0;
-  const seats = ROLES.flatMap((role) => safe[role] ? [safe[role]] : []);
+  const frameDt = Number.isFinite(dt) ? Math.max(0, dt) : 0;
+  const torso = get(safe, "torso");
+  const legacyHead = get(safe, "head");
+  const yaw = safe.torso?.lx ?? legacyHead.lx ?? 0;
+  const pitch = safe.torso?.ly ?? legacyHead.ly ?? 0;
 
-  const movementSeats: RoleInput[] = [];
-  const leftSeats: RoleInput[] = [];
-  const rightSeats: RoleInput[] = [];
-  let hop = false;
-  let boost = false;
-  let boostVotes = 0;
-  let pitch = 0;
+  const head: RoleInput = { ...emptyInput(), lx: yaw, ly: pitch, a: torso.q || legacyHead.a };
 
-  for (const input of seats) {
-    const handMode = input.q || input.e;
-    if (input.q) leftSeats.push(input);
-    if (input.e) rightSeats.push(input);
-    if (!handMode && (input.f !== 0 || input.s !== 0)) {
-      movementSeats.push(input);
+  let sharedArms: RoleInput;
+  if (squad === 3) {
+    sharedArms = { ...get(safe, "arms"), lx: yaw, ly: pitch };
+  } else {
+    const left = safe.lhand;
+    const right = safe.rhand;
+    if (!left && !right) {
+      sharedArms = { ...get(safe, "arms"), lx: yaw, ly: pitch };
+    } else {
+      sharedArms = {
+        f: ((left?.f ?? 0) + (right?.f ?? 0)) / 2,
+        s: ((left?.s ?? 0) + (right?.s ?? 0)) / 2,
+        a: Boolean(left?.a && right?.a),
+        b: Boolean(left?.b && right?.b),
+        q: Boolean(left?.q),
+        e: Boolean(right?.e),
+        lx: yaw,
+        ly: pitch,
+      };
     }
-    hop ||= input.a;
-    boost ||= input.b;
-    if (input.b) boostVotes++;
-    pitch += input.ly;
   }
 
-  const [moveF, moveS] = averageAxes(movementSeats);
-  const [leftF, leftS] = averageAxes(leftSeats);
-  const [rightF, rightS] = averageAxes(rightSeats);
-  const moving = moveF !== 0 || moveS !== 0;
-  const lookPitch = seats.length > 0 ? pitch / seats.length : 0;
-  const distinctHandCrew = seats.length <= 1 || leftSeats.some((left) => rightSeats.some((right) => right !== left));
-  const leftGrab = leftSeats.length > 0;
-  const rightGrab = rightSeats.length > 0 && (distinctHandCrew || !leftGrab);
-  const sharedThrow = boost && (seats.length <= 1 || boostVotes >= 2);
+  const lhand: RoleInput = { ...sharedArms, e: false };
+  const rhand: RoleInput = { ...sharedArms, q: false };
 
-  if (!Number.isFinite(st.heading)) st.heading = 0;
-  st.heading = wrapAngle(st.heading - moveS * TURN_SPEED * frameDt);
-
-  const head: RoleInput = {
-    ...emptyInput(),
-    a: boost,
-    lx: st.heading,
-    ly: lookPitch,
-  };
-  const lhand: RoleInput = {
-    ...emptyInput(),
-    f: leftF,
-    s: leftS,
-    a: leftGrab,
-    b: sharedThrow,
-    q: leftGrab,
-    lx: st.heading,
-    ly: lookPitch,
-  };
-  const rhand: RoleInput = {
-    ...emptyInput(),
-    f: rightF,
-    s: rightS,
-    a: rightGrab,
-    b: sharedThrow,
-    e: rightGrab,
-    lx: st.heading,
-    ly: lookPitch,
-  };
-
-  // A little physical side-step makes turning look planted rather than like a
-  // spinning pawn. Most of A/D still goes into heading above.
-  const gaitF = moveF;
-  const gaitS = moveS * 0.35;
-  let leftActive = false;
-  if (moving) {
-    st.legT += frameDt;
-    leftActive = Math.floor(st.legT / STEP_SECONDS) % 2 === 0;
+  let lleg: RoleInput;
+  let rleg: RoleInput;
+  if (squad === 3) {
+    const legs = safe.legs ?? (safe.lleg ?? safe.rleg);
+    if (!legs || (Math.abs(legs.f) < 0.2 && Math.abs(legs.s) < 0.2)) {
+      lleg = { ...emptyInput(), lx: yaw, ly: pitch, a: Boolean(legs?.a) };
+      rleg = { ...emptyInput(), lx: yaw, ly: pitch, a: Boolean(legs?.a) };
+    } else {
+      state.legT += frameDt;
+      const phase = Math.floor(state.legT / 0.3) % 2;
+      const active: RoleInput = { ...legs, lx: yaw, ly: pitch };
+      const idle: RoleInput = { ...emptyInput(), lx: yaw, ly: pitch, a: legs.a };
+      lleg = phase === 0 ? active : idle;
+      rleg = phase === 1 ? active : idle;
+      lleg.a = Boolean(legs.a);
+      rleg.a = Boolean(legs.a);
+    }
+  } else {
+    lleg = { ...get(safe, "lleg"), lx: yaw, ly: pitch };
+    rleg = { ...get(safe, "rleg"), lx: yaw, ly: pitch };
+    if (safe.legs && !safe.lleg && !safe.rleg) {
+      lleg = { ...safe.legs, lx: yaw, ly: pitch };
+      rleg = { ...safe.legs, lx: yaw, ly: pitch };
+    }
   }
 
-  const makeLeg = (active: boolean): RoleInput => ({
-    ...emptyInput(),
-    f: active && moving ? gaitF : 0,
-    s: active && moving ? gaitS : 0,
-    a: hop,
-    b: boost,
-    lx: st.heading,
-    ly: lookPitch,
-  });
-  const lleg = makeLeg(leftActive);
-  const rleg = makeLeg(moving && !leftActive);
-
-  // The active ragdoll supplies the balance skill automatically. It stays
-  // modest enough to preserve the wobble instead of ironing out the comedy.
-  const torso: RoleInput = {
-    ...emptyInput(),
-    f: moveF * 0.24,
-    s: moveS * 0.12,
-    a: hop,
-    b: boost,
-    lx: st.heading,
-    ly: lookPitch,
-  };
-
-  return { head, lhand, rhand, torso, lleg, rleg };
+  return { head, lhand, rhand, torso: { ...torso, lx: yaw, ly: pitch }, lleg, rleg };
 }

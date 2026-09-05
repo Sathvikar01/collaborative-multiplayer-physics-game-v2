@@ -1,6 +1,6 @@
 # Many Hands
 
-Many Hands is a browser-based cooperative physics game for three- or five-player teams. Everyone drives the same shared ragdoll; players can temporarily take either hand to grab, carry, climb, and throw without assigning anyone a torso or leg job.
+Many Hands is a browser-based cooperative physics game for three- or five-player teams. Players divide control of one shared ragdoll across arms or hands, torso and legs, then coordinate walking, balancing, grabbing, climbing and throwing.
 
 The game is intentionally client-authoritative for physics: one browser is the team host, while the server coordinates rooms, relays inputs/snapshots, handles leases, and elects a replacement host when necessary.
 
@@ -32,7 +32,7 @@ npm run dev
 
 Open the URL printed by Next.js, normally `http://localhost:3000`. Choose **Create room**, or enter a four-character room code to join an existing room.
 
-Controls are shared by every player: `W/S` waddles, `A/D` steers, `Q + WASD` takes the left hand, `E + WASD` takes the right hand, `Space` hops or helps recovery, and `Shift` duck-boosts, throws, and quacks.
+Controls follow the selected body-part role. `WASD` operates that role, while `Space`, `Shift`, `Q` and `E` perform the contextual actions shown on the in-game role card. Use `Tab`/`Shift+Tab` or `1`–`5` to switch between roles you own. Torso owns camera direction, balance and recovery; arms/hands own grabbing and throwing; legs own stepping and jumping.
 
 Production-style local run:
 
@@ -171,7 +171,7 @@ Host takeover snapshots include body transforms/velocities, prop motion, mover p
 
 ### Cooperative physics
 
-Every transport seat contributes to one deterministic movement vote. Matching directions retain full authority, opposed directions cancel into a comic wobble, and an automatic alternating gait drives the internal leg channels. Holding `Q` or `E` routes that player's WASD input to the corresponding hand instead of locomotion. Multiplayer two-hand grabs and throws require two distinct contributors, so hand disagreement still creates real force, grip strain, slips, and drops. Balance and recovery are assisted automatically; falling is funny rather than a torso-player lockout.
+Controls intentionally preserve strict body-part ownership. In three-player mode, Arms controls both hands, Torso controls balance and view, and Legs auto-alternates steps while a direction is held. In five-player mode, each hand and leg has its own player; hand movement is averaged, two-hand grabs and throws require both hand players, and legs remain independent. The physics reactor turns that coordination into real balance, grip strain, slips, drops and recoveries without allowing one role to silently drive another.
 
 ### State-aware commentary
 
@@ -282,7 +282,7 @@ Run the focused suite:
 npm test
 ```
 
-It covers stale SSE cleanup, reconnect seat preservation, immediate host takeover, authenticated route commands, command idempotency, malformed input/state rejection, input expiry, bounded state pipelining, universal crew controls, deterministic commentary and snapshot deduplication, every role/challenge commentary playtest, delayed-snapshot presentation smoothness, fixed-step equivalence, contact-derived support, bilateral load sharing, grip failure, balance failure, and reactor snapshot restoration.
+It covers stale SSE cleanup, reconnect seat preservation, immediate host takeover, authenticated route commands, command idempotency, malformed input/state rejection, input expiry, bounded state pipelining, the singularity2 role-control contract, deterministic commentary and snapshot deduplication, every role/challenge commentary playtest, delayed-snapshot presentation smoothness, fixed-step equivalence, contact-derived support, bilateral load sharing, grip failure, balance failure, and reactor snapshot restoration.
 
 For a complete pre-merge check:
 

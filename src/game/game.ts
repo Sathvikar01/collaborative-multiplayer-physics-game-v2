@@ -1299,11 +1299,9 @@ export class Game {
 
   private frame(dt: number) {
     if (this.isHost && this.body) {
-      // Merge the universal crew controls into locomotion and two independent
-      // hand channels. Expired remote leases become neutral before mixing.
+      // Resolve assigned role controls into the authoritative body channels.
+      // Expired remote leases become neutral before mixing.
       const merged: Partial<Record<Role, RoleInput>> = { ...this.remoteInputBuffer.getMerged(), ...this.localInputs };
-      this.squadMix.heading = this.body.heading;
-      this.squadMix.legT = this.body.time;
       const phys = resolvePhysInputs(merged, this.squadSize, Math.min(dt, 0.1), this.squadMix);
       const reactorFrame = this.reactor?.advance(dt, phys, {
         beforeStep: ({ dt: stepDt }) => this.beforePhysicsStep(stepDt),

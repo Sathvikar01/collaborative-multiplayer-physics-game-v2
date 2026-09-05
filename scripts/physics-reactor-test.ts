@@ -135,8 +135,7 @@ function snapshotMaxDifference(a: PhysicsReactorSnapshot, b: PhysicsReactorSnaps
 async function main() {
   await RAPIER.init();
 
-  // Every network seat can drive, while Q/E temporarily route that player's
-  // WASD into the left/right hand channels.
+  // Keep singularity2's strict role contract at the physics boundary.
   {
     const state = makeSquadMixState();
     const mixed = resolvePhysInputs(
@@ -148,12 +147,12 @@ async function main() {
       DT,
       state,
     );
-    assert.equal(mixed.lhand.f, 1);
-    assert.equal(mixed.rhand.f, -1);
-    assert.equal(mixed.lhand.s, 1);
-    assert.equal(mixed.rhand.s, -1);
-    assert.equal(mixed.lhand.a, true);
-    assert.equal(mixed.rhand.a, true);
+    assert.equal(mixed.lhand.f, 0);
+    assert.equal(mixed.rhand.f, 0);
+    assert.equal(mixed.lhand.s, 0);
+    assert.equal(mixed.rhand.s, 0);
+    assert.equal(mixed.lhand.q, true);
+    assert.equal(mixed.rhand.e, true);
 
     const oneHand = resolvePhysInputs(
       { lhand: input({ q: true }), rhand: input() },
@@ -161,7 +160,7 @@ async function main() {
       DT,
       makeSquadMixState(),
     );
-    assert.equal(oneHand.lhand.a, true);
+    assert.equal(oneHand.lhand.q, true);
     assert.equal(oneHand.rhand.a, false);
 
     const bothHands = resolvePhysInputs(
@@ -170,8 +169,8 @@ async function main() {
       DT,
       makeSquadMixState(),
     );
-    assert.equal(bothHands.lhand.a, true);
-    assert.equal(bothHands.rhand.a, true);
+    assert.equal(bothHands.lhand.q, true);
+    assert.equal(bothHands.rhand.e, true);
     assert.equal(bothHands.lhand.f, 0.5);
     assert.equal(bothHands.rhand.f, 0.5);
   }
@@ -358,9 +357,11 @@ async function main() {
       assert.equal(lostBothSupports, true);
       const fall = events.find((event) => event.type === "fall");
       assert.equal(fall?.reason ?? rig.body.fallReason, "no-foot-support");
-      advance(rig, 3, makeInputs(), events);
-      assert.equal(rig.body.fallen, false, "a fall must recover without a dedicated torso player");
-      assert.ok(events.some((event) => event.type === "getup"), "automatic recovery should emit getup feedback");
+      const recover = makeInputs();
+      recover.torso.a = true;
+      advance(rig, 3, recover, events);
+      assert.equal(rig.body.fallen, false, "Torso Space should recover the body");
+      assert.ok(events.some((event) => event.type === "getup"), "Torso recovery should emit getup feedback");
     } finally {
       disposeRig(rig);
     }

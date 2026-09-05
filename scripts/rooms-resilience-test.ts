@@ -125,7 +125,9 @@ const resizeTokenB = "resize-session-token-b-0000000000";
 assert.equal(join(resizeRoom, "resize-a", "Resize A", () => {}, resizeTokenA, "resize-connection-a"), true);
 assert.equal(join(resizeRoom, "resize-b", "Resize B", () => {}, resizeTokenB, "resize-connection-b"), true);
 assert.equal(setSquadSize(resizeRoom, 3), true);
-assert.ok(snapshot(resizeRoom).players.every((player) => player.roles.length === 1), "resizing must keep every crewmate on an input channel");
+const resizedPlayers = snapshot(resizeRoom).players;
+assert.equal(resizedPlayers.filter((player) => player.roles.length === 1).length, 1, "resizing should clear picks and seed the first role");
+assert.equal(resizedPlayers.find((player) => player.roles.length === 1)?.roles[0], "arms");
 assert.equal(leave(resizeRoom, "resize-a", resizeTokenA, "resize-connection-a"), true);
 assert.equal(leave(resizeRoom, "resize-b", resizeTokenB, "resize-connection-b"), true);
 

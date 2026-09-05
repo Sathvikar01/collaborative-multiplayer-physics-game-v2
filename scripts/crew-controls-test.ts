@@ -1,82 +1,102 @@
 import assert from "node:assert/strict";
 import { makeSquadMixState, resolvePhysInputs } from "../src/game/squad";
-import { ROLES_3, ROLES_5, emptyInput, type Role, type RoleInput, type SquadSize } from "../src/game/types";
+import { emptyInput, type RoleInput } from "../src/game/types";
 
 const input = (patch: Partial<RoleInput> = {}): RoleInput => ({ ...emptyInput(), ...patch });
 
-function from(role: Role, patch: Partial<RoleInput>, squad: SquadSize) {
-  return resolvePhysInputs({ [role]: input(patch) }, squad, 1 / 60, makeSquadMixState());
+// 3P: Arms owns both hands. Space and Shift affect both; Q/E isolate one grab.
+{
+  const both = resolvePhysInputs(
+    { arms: input({ f: 1, s: -0.5, a: true, b: true }) },
+    3,
+    1 / 60,
+    makeSquadMixState(),
+  );
+  assert.equal(both.lhand.f, 1);
+  assert.equal(both.rhand.f, 1);
+  assert.equal(both.lhand.s, -0.5);
+  assert.equal(both.rhand.s, -0.5);
+  assert.equal(both.lhand.a && both.rhand.a, true);
+  assert.equal(both.lhand.b && both.rhand.b, true);
+
+  const singles = resolvePhysInputs(
+    { arms: input({ q: true, e: true }) },
+    3,
+    1 / 60,
+    makeSquadMixState(),
+  );
+  assert.equal(singles.lhand.q, true);
+  assert.equal(singles.lhand.e, false);
+  assert.equal(singles.rhand.q, false);
+  assert.equal(singles.rhand.e, true);
 }
 
-for (const [squad, roles] of [[3, ROLES_3], [5, ROLES_5]] as const) {
-  for (const role of roles) {
-    const movement = from(role, { f: 1 }, squad);
-    assert.ok(movement.lleg.f > 0 || movement.rleg.f > 0, `${role} must be able to move the shared body`);
+// 3P: Legs auto-alternates every 0.3 seconds and Space reaches both legs.
+{
+  const state = makeSquadMixState();
+  const first = resolvePhysInputs({ legs: input({ f: 1, a: true }) }, 3, 0.1, state);
+  assert.equal(first.lleg.f, 1);
+  assert.equal(first.rleg.f, 0);
+  assert.equal(first.lleg.a && first.rleg.a, true);
 
-    const jump = from(role, { a: true }, squad);
-    assert.equal(jump.lleg.a && jump.rleg.a, true, `${role} must be able to trigger the shared hop`);
-    assert.equal(jump.torso.a, true, `${role} must be able to help recovery`);
-
-    const quackBoost = from(role, { b: true }, squad);
-    assert.equal(quackBoost.head.a, true, `${role} must be able to quack`);
-    assert.equal(quackBoost.lleg.b && quackBoost.rleg.b, true, `${role} must be able to boost`);
-    assert.equal(quackBoost.torso.b, true, `${role} must be able to duck under low obstacles`);
-  }
+  const second = resolvePhysInputs({ legs: input({ f: 1 }) }, 3, 0.2, state);
+  assert.equal(second.lleg.f, 0);
+  assert.equal(second.rleg.f, 1);
 }
 
+// 5P: hand movement is averaged. Two-hand Space/Shift requires both players,
+// while Q and E still grab the player's own hand independently.
 {
   const mixed = resolvePhysInputs(
     {
-      arms: input({ f: 1 }),
-      torso: input({ f: -1 }),
+      lhand: input({ f: 1, s: 1, a: true, b: true, q: true }),
+      rhand: input({ f: -0.5, s: -1, a: true, b: false, e: true }),
     },
-    3,
+    5,
     1 / 60,
     makeSquadMixState(),
   );
-  assert.equal(mixed.lleg.f, 0, "opposed movement votes should cancel");
-  assert.equal(mixed.rleg.f, 0, "opposed movement votes should cancel");
+  assert.equal(mixed.lhand.f, 0.25);
+  assert.equal(mixed.rhand.f, 0.25);
+  assert.equal(mixed.lhand.s, 0);
+  assert.equal(mixed.rhand.s, 0);
+  assert.equal(mixed.lhand.a && mixed.rhand.a, true);
+  assert.equal(mixed.lhand.b || mixed.rhand.b, false);
+  assert.equal(mixed.lhand.q, true);
+  assert.equal(mixed.rhand.e, true);
+
+  const oneSpace = resolvePhysInputs(
+    { lhand: input({ a: true }), rhand: input() },
+    5,
+    1 / 60,
+    makeSquadMixState(),
+  );
+  assert.equal(oneSpace.lhand.a || oneSpace.rhand.a, false);
 }
 
+// 5P: legs are independent, and Torso exclusively owns balance/camera/shout.
 {
-  const left = resolvePhysInputs(
+  const mixed = resolvePhysInputs(
     {
-      arms: input({ f: 1, s: -0.5, q: true }),
-      torso: input({ f: 1 }),
+      torso: input({ f: 0.75, s: -1, a: true, b: true, q: true, lx: 1.2, ly: -0.4 }),
+      lleg: input({ f: 1, s: -1, a: true }),
+      rleg: input({ f: -1, s: 1 }),
     },
-    3,
+    5,
     1 / 60,
     makeSquadMixState(),
   );
-  assert.equal(left.lhand.a, true, "Q should grab the left hand");
-  assert.equal(left.lhand.f, 1, "Q + WASD should aim the left hand");
-  assert.equal(left.rhand.a, false, "left-hand mode must not grab the right hand");
-  assert.ok(left.lleg.f > 0 || left.rleg.f > 0, "another crewmate should still be able to drive while a hand is active");
+  assert.equal(mixed.torso.f, 0.75);
+  assert.equal(mixed.torso.s, -1);
+  assert.equal(mixed.head.a, true);
+  assert.equal(mixed.head.lx, 1.2);
+  assert.equal(mixed.head.ly, -0.4);
+  assert.equal(mixed.lleg.f, 1);
+  assert.equal(mixed.rleg.f, -1);
+  assert.equal(mixed.lleg.a, true);
+  assert.equal(mixed.rleg.a, false);
+  assert.equal(mixed.lhand.f, 0);
+  assert.equal(mixed.rhand.f, 0);
 }
 
-{
-  const onePlayerBothHands = resolvePhysInputs(
-    {
-      arms: input({ q: true, e: true }),
-      torso: input(),
-    },
-    3,
-    1 / 60,
-    makeSquadMixState(),
-  );
-  assert.equal(onePlayerBothHands.lhand.a && onePlayerBothHands.rhand.a, false, "a multiplayer two-hand grab needs two distinct crewmates");
-
-  const collaborated = resolvePhysInputs(
-    {
-      arms: input({ q: true, b: true }),
-      torso: input({ e: true, b: true }),
-    },
-    3,
-    1 / 60,
-    makeSquadMixState(),
-  );
-  assert.equal(collaborated.lhand.a && collaborated.rhand.a, true, "distinct crewmates should coordinate both hands");
-  assert.equal(collaborated.lhand.b && collaborated.rhand.b, true, "a shared yeet needs two Shift votes");
-}
-
-console.log("shared crew control checks passed");
+console.log("singularity2 character-control contract checks passed");
