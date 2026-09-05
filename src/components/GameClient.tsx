@@ -7,6 +7,7 @@ import type { Game, HudState, Snap } from "@/game/game";
 import { Net } from "@/game/net";
 import { InputManager, inputsEqual } from "@/game/input";
 import { getLevel } from "@/game/levels";
+import { RoleGlyph } from "@/components/RoleGlyph";
 
 interface ScoreRow {
   id: number;
@@ -82,6 +83,7 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
   const [pointerLocked, setPointerLocked] = useState(false);
   const [finishToast, setFinishToast] = useState<{ team: string; time: number; color: string } | null>(null);
   const [myFinish, setMyFinish] = useState<number | null>(null);
+  const [roleCardOpen, setRoleCardOpen] = useState(() => typeof window === "undefined" || !window.matchMedia("(max-width: 767px)").matches);
 
   const me = useMemo(() => room?.players.find((p) => p.id === identity.pid) ?? null, [room, identity.pid]);
   const myTeam = useMemo(() => room?.teams.find((t) => t.id === me?.teamId) ?? null, [room, me]);
@@ -438,67 +440,116 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
     if ((myRoles.includes("torso") || myRoles.includes("head")) && room?.phase !== "lobby") inputRef.current?.requestPointerLock();
   };
 
+  const copyInviteLink = async () => {
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable");
+      await navigator.clipboard.writeText(`${location.origin}/play/${code}`);
+      addToast("Invite link copied", "good");
+    } catch {
+      addToast("Couldn’t copy the invite link. Copy it from the address bar.", "bad");
+    }
+  };
+
   const allReady = !!room && room.players.length > 0 && room.players.every((p) => p.connected && p.ready);
   const phase = room?.phase ?? "lobby";
   const sortedTeams = room ? [...room.teams].sort((a, b) => (a.finishMs ?? 1e12) - (b.finishMs ?? 1e12)) : [];
   const level = room ? getLevel(room.challengeId) : null;
 
   return (
-    <div className="relative h-dvh w-full overflow-hidden bg-[#0b1020] text-white select-none">
-      <canvas ref={canvasRef} onClick={onCanvasClick} className="absolute inset-0 h-full w-full block" style={{ width: "100%", height: "100%" }} />
+    <div className="relative h-dvh w-full overflow-hidden bg-[#080b0c] text-white select-none">
+      <canvas
+        ref={canvasRef}
+        onClick={onCanvasClick}
+        className="absolute inset-0 block h-full w-full touch-none outline-none focus-visible:outline-2 focus-visible:outline-[#c2ff7a] focus-visible:outline-offset-[-4px]"
+        style={{ width: "100%", height: "100%" }}
+        role="application"
+        aria-label="Many Hands physics game canvas"
+        aria-describedby="game-help"
+        tabIndex={0}
+      />
+      <div className="game-cinematic-overlay" aria-hidden="true" />
+      <div id="game-help" className="sr-only">
+        Use your assigned body-part keys to move. Click the game canvas to capture the mouse when controlling the head or torso.
+      </div>
 
       {/* Loading */}
       {(!room || !gameReady) && (
-        <div className="absolute inset-0 z-40 flex flex-col items-center justify-center bg-[#0b1020]">
-          <div className="text-5xl font-black tracking-tight mb-3">
-            MANY <span className="text-[#ffd23f]">HANDS</span>
+        <div className="absolute inset-0 z-40 flex flex-col items-center justify-center bg-[#080b0c] px-6 text-center" role="status" aria-live="polite" aria-busy="true">
+          <div className="mb-3 text-4xl font-black tracking-tight sm:text-5xl">
+            MANY <span className="text-[#c2ff7a]">HANDS</span>
           </div>
-          <div className="text-white/60 animate-pulse">{connErr ? "Reconnecting…" : "Loading physics & shaders…"}</div>
+          <div className="animate-pulse text-sm text-white/60 sm:text-base">{connErr ? "Connection interrupted" : "Loading physics & shaders…"}</div>
+          {connErr && (
+            <div className="mt-5 flex flex-col items-center gap-3">
+              <p className="max-w-xs text-xs leading-relaxed text-white/50">The room is trying to reconnect. Your session is preserved.</p>
+              <button
+                type="button"
+                onClick={() => window.location.reload()}
+                className="min-h-11 rounded-xl bg-[#c2ff7a] px-5 py-2.5 text-sm font-black text-black transition hover:brightness-110 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#c2ff7a]"
+              >
+                Try again
+              </button>
+            </div>
+          )}
         </div>
       )}
 
       {connErr && room && (
-        <div className="pointer-events-none absolute left-1/2 top-16 z-40 -translate-x-1/2 rounded-xl border border-[#ffd23f]/40 bg-black/80 px-4 py-2 text-center text-sm font-bold shadow-xl backdrop-blur">
-          Reconnecting… controls are buffered safely and stale inputs will be released.
+        <div className="absolute left-1/2 top-[max(4.75rem,env(safe-area-inset-top))] z-40 flex w-[min(92vw,34rem)] -translate-x-1/2 items-center justify-between gap-3 rounded-2xl border border-[#c2ff7a]/40 bg-[#080b0c]/90 px-4 py-3 text-left text-xs font-bold shadow-[0_18px_60px_rgba(0,0,0,0.42)] backdrop-blur-xl sm:text-sm" role="alert">
+          <span>Reconnecting… controls are buffered safely.</span>
+          <button
+            type="button"
+            onClick={() => window.location.reload()}
+            className="min-h-11 shrink-0 rounded-lg bg-[#c2ff7a] px-3 text-xs font-black text-black transition hover:brightness-110 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#c2ff7a]"
+          >
+            Retry
+          </button>
         </div>
       )}
 
       {/* Top bar */}
-      <div className="pointer-events-none absolute top-0 left-0 right-0 z-20 flex items-start justify-between p-4">
-        <div className="pointer-events-auto flex items-center gap-3">
-          <Link href="/" className="rounded-xl bg-black/40 backdrop-blur px-3 py-2 text-sm font-bold hover:bg-black/60">
+      <div className="pointer-events-none absolute inset-x-0 top-0 z-20 grid grid-cols-[1fr_auto] gap-x-2 gap-y-2 p-3 pt-[max(0.75rem,env(safe-area-inset-top))] sm:flex sm:items-start sm:justify-between sm:p-4">
+        <div className="pointer-events-auto flex min-w-0 items-center gap-2 sm:gap-3">
+          <Link href="/" className="flex min-h-11 items-center rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm font-bold backdrop-blur-xl transition hover:bg-black/60 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#c2ff7a]">
             ← Lobby
           </Link>
-          <div className="rounded-xl bg-black/40 backdrop-blur px-3 py-2 text-sm">
-            Room <span className="font-black tracking-widest text-[#ffd23f]">{code}</span>
+          <div className="min-w-0 rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm backdrop-blur-xl">
+            <span className="hidden text-white/60 sm:inline">Room </span><span className="font-black tracking-widest text-[#c2ff7a]">{code}</span>
           </div>
         </div>
         {/* Timer */}
         {phase !== "lobby" && (
-          <div className="flex flex-col items-center">
-            <div className="rounded-2xl bg-black/50 backdrop-blur px-6 py-2 text-center shadow-lg">
-              <div className="font-mono text-4xl font-black tabular-nums tracking-tight">{formatTime((myFinish ?? (hud?.timer ?? 0) * 1000) || 0)}</div>
-              <div className="text-xs uppercase tracking-widest text-white/70">
+          <div className="col-span-2 order-3 flex justify-center sm:absolute sm:left-1/2 sm:top-3 sm:order-none sm:-translate-x-1/2 sm:justify-start">
+            <div className="rounded-2xl border border-white/10 bg-black/55 px-5 py-2 text-center shadow-[0_16px_50px_rgba(0,0,0,0.35)] backdrop-blur-xl sm:px-6">
+              <div className="font-mono text-3xl font-black tabular-nums tracking-tight sm:text-4xl">{formatTime((myFinish ?? (hud?.timer ?? 0) * 1000) || 0)}</div>
+              <div className="max-w-[min(76vw,24rem)] truncate text-[10px] uppercase tracking-[0.16em] text-white/65 sm:text-xs sm:tracking-widest">
                 {challenge.icon} {level?.objective}
                 {hud && hud.scoreTarget > 0 ? ` · ${hud.score}/${hud.scoreTarget}` : ""}
               </div>
             </div>
           </div>
         )}
-        <div className="pointer-events-auto flex items-center gap-2">
-          <button onClick={() => setMuted((m) => !m)} className="rounded-xl bg-black/40 backdrop-blur px-3 py-2 text-sm font-bold hover:bg-black/60">
-            {muted ? "🔇" : "🔊"}
+        <div className="pointer-events-auto flex items-center justify-end gap-2">
+          <button
+            type="button"
+            onClick={() => setMuted((m) => !m)}
+            className="flex min-h-11 min-w-11 items-center justify-center rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-sm font-bold backdrop-blur-xl transition hover:bg-black/60 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#c2ff7a]"
+            aria-pressed={muted}
+            aria-label={muted ? "Unmute game audio" : "Mute game audio"}
+            title={muted ? "Unmute game audio" : "Mute game audio"}
+          >
+            <span aria-hidden="true">{muted ? "Muted" : "Audio"}</span>
           </button>
         </div>
       </div>
 
       {/* Team status (right side) */}
       {room && phase !== "lobby" && (
-        <div className="pointer-events-none absolute right-4 top-20 z-20 flex flex-col gap-2">
+        <div className="pointer-events-none absolute right-3 top-[max(8.25rem,calc(env(safe-area-inset-top)+7rem))] z-20 flex max-w-[calc(100vw-1.5rem)] flex-col items-end gap-2 sm:right-4 sm:top-20">
           {sortedTeams.map((t) => (
-            <div key={t.id} className="flex items-center gap-2 rounded-xl bg-black/40 backdrop-blur px-3 py-1.5 text-sm">
+            <div key={t.id} className="flex max-w-full items-center gap-2 rounded-xl border border-white/10 bg-black/45 px-3 py-1.5 text-sm backdrop-blur-xl">
               <span className="h-3 w-3 rounded-full" style={{ background: t.color }} />
-              <span className="font-bold">{t.name}</span>
+              <span className="truncate font-bold">{t.name}</span>
               <span className="font-mono text-white/80">{t.finishMs != null ? formatTime(t.finishMs) : "…"}</span>
             </div>
           ))}
@@ -507,76 +558,92 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
 
       {/* Role card */}
       {room && me && currentRole && (
-        <div className="absolute bottom-4 left-4 z-20 w-[320px] max-w-[calc(100vw-2rem)]">
+        <div className="absolute bottom-[max(0.75rem,env(safe-area-inset-bottom))] left-3 z-20 w-[min(360px,calc(100vw-1.5rem))] sm:bottom-4 sm:left-4">
           {myRoles.length > 1 && (
-            <div className="mb-2 flex gap-1">
+          <div className="mb-2 flex gap-1 overflow-x-auto pb-0.5">
               {myRoles.map((r, i) => (
                 <button
+                  type="button"
                   key={r}
                   onClick={() => {
                     activeRoleRef.current = i;
                     setActiveRole(i);
                   }}
-                  className={`rounded-lg px-2 py-1 text-xs font-bold ${i === activeRole ? "bg-[#ffd23f] text-black" : "bg-black/40 text-white/80 hover:bg-black/60"}`}
+                  className={`flex min-h-[3.25rem] w-[4.25rem] shrink-0 flex-col items-center justify-center rounded-lg border border-white/10 px-1.5 py-1.5 text-[10px] font-bold transition focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#c2ff7a] ${i === activeRole ? "bg-[#c2ff7a] text-black" : "bg-black/55 text-white/80 hover:bg-black/70"}`}
+                  aria-pressed={i === activeRole}
                 >
-                  {i + 1} {ROLE_INFO[r].emoji} {ROLE_INFO[r].short}
+                  <span className="flex items-center gap-1 opacity-70" aria-hidden="true"><span>{i + 1}</span><RoleGlyph role={r} className="h-3.5 w-3.5" /></span>
+                  <span className="mt-0.5 tracking-wide">{ROLE_INFO[r].short}</span>
                 </button>
               ))}
             </div>
           )}
-          <div className="rounded-2xl bg-black/50 backdrop-blur p-4 shadow-xl border border-white/10">
-            <div className="flex items-center gap-3">
-              <div className="text-4xl">{ROLE_INFO[currentRole].emoji}</div>
-              <div>
-                <div className="text-[10px] uppercase tracking-widest text-white/60">You control</div>
-                <div className="text-xl font-black" style={{ color: myTeam?.color }}>
-                  {ROLE_INFO[currentRole].label}
+          <div className="w-[min(320px,100%)] overflow-hidden rounded-2xl border border-white/10 bg-[#080b0c]/80 shadow-[0_18px_60px_rgba(0,0,0,0.4)] backdrop-blur-xl">
+            <button
+              type="button"
+              onClick={() => setRoleCardOpen((open) => !open)}
+              className="flex min-h-11 w-full items-center justify-between gap-3 px-4 py-3 text-left focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-[#c2ff7a] md:cursor-default"
+              aria-expanded={roleCardOpen}
+              aria-controls="role-controls"
+            >
+              <span className="flex items-center gap-3">
+                <RoleGlyph role={currentRole} className="h-9 w-9 text-white/85" />
+                <span>
+                  <span className="block text-[10px] uppercase tracking-widest text-white/60">You control</span>
+                  <span className="block text-lg font-black sm:text-xl" style={{ color: myTeam?.color }}>
+                    {ROLE_INFO[currentRole].label}
+                  </span>
+                </span>
+              </span>
+              <span className="text-xs font-black uppercase tracking-widest text-white/55 md:hidden" aria-hidden="true">{roleCardOpen ? "Hide" : "Show"}</span>
+            </button>
+            {roleCardOpen && (
+              <div id="role-controls" className="border-t border-white/10 px-4 pb-4 pt-3">
+                <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
+                  {ROLE_INFO[currentRole].keys.map((k) => (
+                    <div key={k.key} className="contents">
+                      <kbd className="rounded bg-white/15 px-1.5 py-0.5 font-mono text-[11px] font-bold whitespace-nowrap">{k.key}</kbd>
+                      <span className="text-white/80">{k.does}</span>
+                    </div>
+                  ))}
+                  {myRoles.length > 1 && (
+                    <div className="contents">
+                      <kbd className="rounded bg-white/15 px-1.5 py-0.5 font-mono text-[11px] font-bold">Tab / 1-5</kbd>
+                      <span className="text-white/80">Switch body part</span>
+                    </div>
+                  )}
                 </div>
+                {currentRole === "head" && !pointerLocked && phase !== "lobby" && <div className="mt-3 text-[11px] leading-relaxed text-[#c2ff7a]">Click the game to capture the mouse</div>}
               </div>
-            </div>
-            <div className="mt-3 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
-              {ROLE_INFO[currentRole].keys.map((k) => (
-                <div key={k.key} className="contents">
-                  <kbd className="rounded bg-white/15 px-1.5 py-0.5 font-mono font-bold text-[11px] whitespace-nowrap">{k.key}</kbd>
-                  <span className="text-white/80">{k.does}</span>
-                </div>
-              ))}
-              {myRoles.length > 1 && (
-                <div className="contents">
-                  <kbd className="rounded bg-white/15 px-1.5 py-0.5 font-mono font-bold text-[11px]">Tab / 1-5</kbd>
-                  <span className="text-white/80">Switch body part</span>
-                </div>
-              )}
-            </div>
-            {currentRole === "head" && !pointerLocked && phase !== "lobby" && <div className="mt-2 text-[11px] text-[#ffd23f]">Click the game to capture the mouse</div>}
+            )}
           </div>
         </div>
       )}
 
       {/* Status chips */}
       {hud && phase !== "lobby" && (
-        <div className="pointer-events-none absolute bottom-4 right-4 z-20 flex flex-col items-end gap-2">
-          {hud.fallen && <div className="animate-bounce rounded-xl bg-[#ff5d5d] px-4 py-2 font-black shadow-lg">FALLEN! Torso: hold SPACE to get up</div>}
+        <div className={`pointer-events-none absolute right-3 z-20 flex max-w-[calc(100vw-1.5rem)] flex-col items-end gap-2 sm:bottom-4 sm:right-4 ${roleCardOpen && currentRole ? "bottom-[max(14.5rem,calc(env(safe-area-inset-bottom)+13.75rem))]" : "bottom-[max(0.75rem,env(safe-area-inset-bottom))]"}`} aria-live="polite">
+          {hud.fallen && <div className="animate-pulse rounded-xl bg-[#ff5d5d] px-4 py-2 font-black shadow-lg">FALLEN! Torso: hold SPACE to get up</div>}
           {hud.hanging && <div className="rounded-xl bg-[#4fa8ff] px-4 py-2 font-black shadow-lg">HANGING · Arms: S to pull up · Legs: step!</div>}
           {hud.holding > 0 && !hud.hanging && <div className="rounded-xl bg-[#6ef29a] text-black px-4 py-2 font-black shadow-lg">HOLDING · Arms: Shift to throw</div>}
           {hud.crouch && <div className="rounded-xl bg-black/50 px-3 py-1 text-sm font-bold">Crouching</div>}
           {isHost && hud.brace < 1 && (
             <div className="w-40 rounded-full bg-black/50 p-1">
-              <div className="h-2 rounded-full bg-[#ffd23f] transition-all" style={{ width: `${hud.brace * 100}%` }} />
+              <div className="h-2 rounded-full bg-[#c2ff7a] transition-all" style={{ width: `${hud.brace * 100}%` }} />
             </div>
           )}
         </div>
       )}
 
       {/* Toasts */}
-      <div className="pointer-events-none absolute left-1/2 top-[22%] z-30 flex -translate-x-1/2 flex-col items-center gap-2">
+      <div className="pointer-events-none absolute left-1/2 top-[22%] z-30 flex w-[min(92vw,34rem)] -translate-x-1/2 flex-col items-center gap-2" aria-live="polite" aria-atomic="true">
         {toasts.map((t) => (
-          <div key={t.id} className={`toast rounded-2xl px-5 py-2 text-lg font-black shadow-xl ${t.tone === "good" ? "bg-[#6ef29a] text-black" : t.tone === "bad" ? "bg-[#ff5d5d]" : "bg-black/60"}`}>
+          <div key={t.id} className={`toast max-w-full rounded-2xl px-5 py-2 text-center text-sm font-black shadow-xl sm:text-lg ${t.tone === "good" ? "bg-[#6ef29a] text-black" : t.tone === "bad" ? "bg-[#ff5d5d]" : "bg-black/60"}`}>
             {t.text}
           </div>
         ))}
         {finishToast && (
-          <div className="toast rounded-2xl px-5 py-2 text-lg font-black shadow-xl text-black" style={{ background: finishToast.color }}>
+          <div className="toast max-w-full rounded-2xl px-5 py-2 text-center text-sm font-black text-black shadow-xl sm:text-lg" style={{ background: finishToast.color }}>
             🏁 {finishToast.team} finished in {formatTime(finishToast.time)}!
           </div>
         )}
@@ -585,7 +652,7 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
       {/* Countdown */}
       {countdown !== null && (
         <div className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center">
-          <div key={countdown} className="countdown text-[10rem] font-black drop-shadow-[0_8px_0_rgba(0,0,0,0.4)]" style={{ color: countdown === 0 ? "#6ef29a" : "#ffd23f" }}>
+          <div key={countdown} className="countdown text-[clamp(5rem,22vw,10rem)] font-black drop-shadow-[0_8px_0_rgba(0,0,0,0.4)]" style={{ color: countdown === 0 ? "#c2ff7a" : "#ddd5b7" }}>
             {countdown === 0 ? "GO!" : countdown}
           </div>
         </div>
@@ -594,7 +661,7 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
       {/* Finish banner (mine) */}
       {myFinish != null && phase === "playing" && (
         <div className="pointer-events-none absolute inset-x-0 top-[30%] z-30 flex flex-col items-center">
-          <div className="countdown text-6xl font-black text-[#ffd23f] drop-shadow-[0_6px_0_rgba(0,0,0,0.4)]">FINISHED!</div>
+          <div className="countdown text-[clamp(2.75rem,12vw,3.75rem)] font-black text-[#c2ff7a] drop-shadow-[0_6px_0_rgba(0,0,0,0.4)]">FINISHED!</div>
           <div className="mt-2 font-mono text-3xl font-black">{formatTime(myFinish)}</div>
           <div className="mt-1 text-white/80">Waiting for other teams…</div>
         </div>
@@ -602,19 +669,18 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
 
       {/* Lobby panel */}
       {room && me && phase === "lobby" && (
-        <div className="absolute inset-y-0 right-0 z-20 flex w-full max-w-[440px] flex-col gap-3 overflow-y-auto p-4 pt-20">
-          <div className="rounded-2xl bg-black/60 backdrop-blur p-4 border border-white/10 shadow-xl">
+        <div className="absolute inset-x-0 bottom-0 top-16 z-20 flex max-h-[calc(100dvh-4rem)] w-full flex-col gap-3 overflow-y-auto overscroll-contain rounded-t-[2rem] border-t border-white/10 bg-[#080b0c]/82 p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] backdrop-blur-xl sm:p-4 md:inset-y-0 md:left-auto md:top-0 md:h-full md:max-h-none md:w-full md:max-w-[440px] md:rounded-none md:border-t-0 md:bg-transparent md:pt-20 md:backdrop-blur-none" role="region" aria-labelledby="lobby-title">
+          <h1 id="lobby-title" className="sr-only">Room lobby</h1>
+          <div className="rounded-2xl border border-white/10 bg-[#080b0c]/88 p-4 shadow-[0_18px_60px_rgba(0,0,0,0.36)] backdrop-blur-xl">
             <div className="flex items-center justify-between">
               <div>
                 <div className="text-[10px] uppercase tracking-widest text-white/60">Room code</div>
-                <div className="text-3xl font-black tracking-[0.3em] text-[#ffd23f]">{code}</div>
+                <div className="text-3xl font-black tracking-[0.3em] text-[#c2ff7a]">{code}</div>
               </div>
               <button
-                onClick={() => {
-                  void navigator.clipboard?.writeText(`${location.origin}/play/${code}`);
-                  addToast("Invite link copied!", "good");
-                }}
-                className="rounded-xl bg-white/10 px-3 py-2 text-sm font-bold hover:bg-white/20"
+                type="button"
+                onClick={() => void copyInviteLink()}
+                className="min-h-11 rounded-xl bg-white/10 px-3 py-2 text-sm font-bold transition hover:bg-white/20 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#c2ff7a]"
               >
                 Copy invite link
               </button>
@@ -623,15 +689,16 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
           </div>
 
           {/* Squad size */}
-          <div className="rounded-2xl bg-black/60 backdrop-blur p-4 border border-white/10">
+          <div className="rounded-2xl border border-white/10 bg-[#080b0c]/88 p-4 backdrop-blur-xl">
             <div className="mb-2 text-[10px] uppercase tracking-widest text-white/60">Squad size {isLeader ? "(you pick)" : ""}</div>
             <div className="grid grid-cols-2 gap-2">
               {([3, 5] as SquadSize[]).map((n) => (
                 <button
+                  type="button"
                   key={n}
                   disabled={!isLeader}
                   onClick={() => send("setSquad", { squadSize: n })}
-                  className={`rounded-xl px-3 py-2 text-left transition ${room.squadSize === n ? "bg-[#6ef29a] text-black" : "bg-white/5 hover:bg-white/10 disabled:hover:bg-white/5"}`}
+                  className={`min-h-11 rounded-xl px-3 py-2 text-left transition focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#c2ff7a] ${room.squadSize === n ? "bg-[#c2ff7a] text-black" : "bg-white/5 hover:bg-white/10 disabled:hover:bg-white/5"}`}
                 >
                   <div className="font-black leading-tight">{n} players</div>
                   <div className={`text-xs ${room.squadSize === n ? "text-black/70" : "text-white/60"}`}>
@@ -644,15 +711,16 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
           </div>
 
           {/* Challenge */}
-          <div className="rounded-2xl bg-black/60 backdrop-blur p-4 border border-white/10">
+          <div className="rounded-2xl border border-white/10 bg-[#080b0c]/88 p-4 backdrop-blur-xl">
             <div className="mb-2 text-[10px] uppercase tracking-widest text-white/60">Challenge {isLeader ? "(you pick)" : ""}</div>
             <div className="flex flex-col gap-2">
               {CHALLENGES.map((c) => (
                 <button
+                  type="button"
                   key={c.id}
                   disabled={!isLeader}
                   onClick={() => send("setChallenge", { challengeId: c.id })}
-                  className={`flex items-center gap-3 rounded-xl px-3 py-2 text-left transition ${room.challengeId === c.id ? "bg-[#ffd23f] text-black" : "bg-white/5 hover:bg-white/10 disabled:hover:bg-white/5"}`}
+                  className={`flex min-h-11 items-center gap-3 rounded-xl px-3 py-2 text-left transition focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#c2ff7a] ${room.challengeId === c.id ? "bg-[#ddd5b7] text-black" : "bg-white/5 hover:bg-white/10 disabled:hover:bg-white/5"}`}
                 >
                   <span className="text-2xl">{c.icon}</span>
                   <div className="min-w-0">
@@ -674,7 +742,7 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
             const members = room.players.filter((p) => p.teamId === t.id);
             const mine = t.id === me.teamId;
             return (
-              <div key={t.id} className="rounded-2xl bg-black/60 backdrop-blur p-4 border" style={{ borderColor: mine ? t.color : "rgba(255,255,255,0.1)" }}>
+              <div key={t.id} className="rounded-2xl border bg-[#080b0c]/88 p-4 backdrop-blur-xl" style={{ borderColor: mine ? t.color : "rgba(255,255,255,0.1)" }}>
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     <span className="h-3 w-3 rounded-full" style={{ background: t.color }} />
@@ -684,7 +752,7 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
                     </span>
                   </div>
                   {!mine && members.length < room.squadSize && (
-                    <button onClick={() => send("setTeam", { teamId: t.id })} className="rounded-lg bg-white/10 px-2 py-1 text-xs font-bold hover:bg-white/20">
+                    <button type="button" onClick={() => send("setTeam", { teamId: t.id })} className="min-h-11 rounded-lg bg-white/10 px-3 py-2 text-xs font-bold transition hover:bg-white/20 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#c2ff7a]">
                       Join
                     </button>
                   )}
@@ -695,14 +763,15 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
                     const isMe = owner?.id === me.id;
                     return (
                       <button
+                        type="button"
                         key={r}
                         disabled={!mine}
                         onClick={() => send("setRole", { role: r })}
                         title={ROLE_INFO[r].blurb}
-                        className={`flex flex-col items-center rounded-xl px-1 py-2 text-center transition ${isMe ? "text-black" : owner ? "bg-white/15" : "bg-white/5 hover:bg-white/10"}`}
+                        className={`flex min-h-11 flex-col items-center rounded-xl px-1 py-2 text-center transition focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#c2ff7a] ${isMe ? "text-black" : owner ? "bg-white/15" : "bg-white/5 hover:bg-white/10"}`}
                         style={isMe ? { background: t.color } : undefined}
                       >
-                        <span className="text-xl">{ROLE_INFO[r].emoji}</span>
+                        <RoleGlyph role={r} className="h-6 w-6" />
                         <span className="text-[9px] font-black uppercase tracking-wide">{ROLE_INFO[r].short}</span>
                         <span className={`mt-0.5 line-clamp-1 text-[10px] ${isMe ? "text-black/80" : "text-white/70"}`}>{owner ? owner.name : "free"}</span>
                       </button>
@@ -711,7 +780,7 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
                 </div>
                 <div className="mt-2 flex flex-wrap gap-1">
                   {members.map((m) => (
-                    <span key={m.id} className={`rounded-full px-2 py-0.5 text-[11px] ${!m.connected ? "bg-[#ffd23f]/20 text-[#ffd23f]" : m.ready ? "bg-[#6ef29a] text-black" : "bg-white/10"}`}>
+                    <span key={m.id} className={`rounded-full px-2 py-0.5 text-[11px] ${!m.connected ? "bg-[#ddd5b7]/20 text-[#ddd5b7]" : m.ready ? "bg-[#c2ff7a] text-black" : "bg-white/10"}`}>
                       {m.name}
                       {m.id === t.hostId ? " ★" : ""}
                       {!m.connected ? " · reconnecting" : m.ready ? " ✓" : ""}
@@ -721,22 +790,23 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
               </div>
             );
           })}
-          <button onClick={() => send("setTeam", { teamId: "new" })} className="rounded-2xl border border-dashed border-white/20 py-2 text-sm font-bold text-white/70 hover:bg-white/5">
+          <button type="button" onClick={() => send("setTeam", { teamId: "new" })} className="min-h-11 rounded-2xl border border-dashed border-white/20 py-2 text-sm font-bold text-white/70 transition hover:bg-white/5 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#c2ff7a]">
             + New team (compete on the same course)
           </button>
 
-          <div className="sticky bottom-0 flex flex-col gap-2 rounded-2xl bg-black/70 backdrop-blur p-3 border border-white/10">
+          <div className="sticky bottom-0 flex flex-col gap-2 rounded-2xl border border-white/10 bg-[#080b0c]/95 p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] shadow-[0_-16px_45px_rgba(0,0,0,0.32)] backdrop-blur-xl" aria-label="Lobby actions">
             <div className="flex gap-2">
-              <button onClick={toggleReady} className={`flex-1 rounded-xl py-3 text-lg font-black transition ${ready ? "bg-[#6ef29a] text-black" : "bg-white text-black hover:bg-[#ffd23f]"}`}>
+              <button type="button" onClick={toggleReady} className={`min-h-11 flex-1 rounded-xl py-3 text-lg font-black transition focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#c2ff7a] ${ready ? "bg-[#c2ff7a] text-black" : "bg-white text-black hover:bg-[#c2ff7a]"}`} aria-pressed={ready}>
                 {ready ? "READY ✓" : "READY UP"}
               </button>
               {isLeader && (
                 <button
+                  type="button"
                   onClick={() => {
                     ensureAudio();
                     send("start", { force: !allReady });
                   }}
-                  className={`flex-1 rounded-xl py-3 text-lg font-black transition ${allReady ? "bg-[#ffd23f] text-black animate-pulse" : "bg-white/10 text-white/70 hover:bg-white/20"}`}
+                  className={`min-h-11 flex-1 rounded-xl py-3 text-lg font-black transition focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#c2ff7a] ${allReady ? "bg-[#c2ff7a] text-black animate-pulse" : "bg-white/10 text-white/70 hover:bg-white/20"}`}
                 >
                   {allReady ? "START!" : "Start anyway"}
                 </button>
@@ -751,11 +821,11 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
 
       {/* Results */}
       {room && phase === "results" && (
-        <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
-          <div className="w-full max-w-3xl rounded-3xl bg-[#121a33] border border-white/10 p-6 shadow-2xl">
+        <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/55 p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] backdrop-blur-sm sm:p-4" role="dialog" aria-modal="true" aria-labelledby="results-title">
+          <div className="max-h-[calc(100dvh-1.5rem)] w-full max-w-3xl overflow-y-auto overscroll-contain rounded-3xl border border-white/10 bg-[#121a33]/95 p-4 shadow-[0_24px_90px_rgba(0,0,0,0.5)] backdrop-blur-xl sm:max-h-[calc(100dvh-2rem)] sm:p-6">
             <div className="text-center">
               <div className="text-[11px] uppercase tracking-[0.3em] text-white/60">{challenge.name}</div>
-              <div className="text-4xl font-black">RESULTS</div>
+              <h1 id="results-title" className="text-4xl font-black">RESULTS</h1>
             </div>
             <div className="mt-5 grid gap-6 md:grid-cols-2">
               <div>
@@ -779,6 +849,7 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
                   <span className="flex gap-1">
                     {([3, 5] as SquadSize[]).map((n) => (
                       <button
+                        type="button"
                         key={n}
                         onClick={() => {
                           setBoardSquad(n);
@@ -789,7 +860,7 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
                               .catch(() => {});
                           }
                         }}
-                        className={`rounded-lg px-2 py-0.5 text-xs font-black ${boardSquad === n ? "bg-[#6ef29a] text-black" : "bg-white/10 text-white/70 hover:bg-white/20"}`}
+                        className={`min-h-11 rounded-lg px-3 py-1 text-xs font-black transition focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#c2ff7a] ${boardSquad === n ? "bg-[#c2ff7a] text-black" : "bg-white/10 text-white/70 hover:bg-white/20"}`}
                       >
                         {n}P
                       </button>
@@ -801,7 +872,7 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
                   {leaderboard.map((row, i) => {
                     const isUs = !!myTeam && row.teamName === myTeam.name && myFinish != null && row.timeMs === myFinish;
                     return (
-                      <div key={row.id} className={`flex items-center gap-2 rounded-lg px-2 py-1 text-sm ${isUs ? "bg-[#ffd23f] text-black" : "bg-white/5"}`}>
+                      <div key={row.id} className={`flex items-center gap-2 rounded-lg px-2 py-1 text-sm ${isUs ? "bg-[#c2ff7a] text-black" : "bg-white/5"}`}>
                         <span className="w-6 font-black">{i + 1}</span>
                         <span className="flex-1 truncate">
                           <span className="font-bold">{row.teamName}</span> <span className="opacity-60 text-xs">{(row.players ?? []).join(", ")}</span>
@@ -816,10 +887,10 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
             <div className="mt-6 flex flex-col items-center gap-2">
               {isLeader ? (
                 <div className="flex gap-2">
-                  <button onClick={() => send("start", { force: true })} className="rounded-xl bg-[#ffd23f] px-6 py-3 text-lg font-black text-black hover:brightness-110">
+                  <button type="button" onClick={() => send("start", { force: true })} className="min-h-11 rounded-xl bg-[#c2ff7a] px-6 py-3 text-lg font-black text-black transition hover:brightness-110 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#c2ff7a]">
                     ↻ Play again
                   </button>
-                  <button onClick={() => send("lobby")} className="rounded-xl bg-white/10 px-6 py-3 text-lg font-black hover:bg-white/20">
+                  <button type="button" onClick={() => send("lobby")} className="min-h-11 rounded-xl bg-white/10 px-6 py-3 text-lg font-black transition hover:bg-white/20 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#c2ff7a]">
                     Change challenge
                   </button>
                 </div>
