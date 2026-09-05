@@ -50,12 +50,12 @@ export interface LevelDef {
   water?: string;
 }
 
-const GRASS = "#7dd36a";
-const GRASS_SIDE = "#4f8f43";
-const STONE = "#c9c2b6";
-const STONE_SIDE = "#8d857a";
-const WOOD = "#d9a066";
-const WOOD_SIDE = "#a06a3a";
+const GRASS = "#7ba66c";
+const GRASS_SIDE = "#48634b";
+const STONE = "#c2beb3";
+const STONE_SIDE = "#78756e";
+const WOOD = "#b88d61";
+const WOOD_SIDE = "#70513a";
 
 function ground(pos: V3, size: V3, extra: Partial<StaticDef> = {}): StaticDef {
   return { pos, size, color: GRASS_SIDE, top: GRASS, kind: "ground", grab: false, ...extra };
@@ -161,12 +161,12 @@ const slamDunk: LevelDef = {
   hoop: { pos: [0, 2.7, -12], radius: 0.62, zone: { pos: [0, 2.35, -12], size: [1.0, 0.5, 1.0] } },
 };
 
-const CANYON_TOP = "#c96f2e";
-const CANYON_SIDE = "#7a3f16";
-const CANYON_GROUND = "#e8a75c";
-const CANYON_GROUND_SIDE = "#8a5a26";
-const FERRY = "#4fd1c5";
-const FERRY_SIDE = "#237a74";
+const CANYON_TOP = "#b87549";
+const CANYON_SIDE = "#694530";
+const CANYON_GROUND = "#c49362";
+const CANYON_GROUND_SIDE = "#74513a";
+const FERRY = "#6ca8a0";
+const FERRY_SIDE = "#365f5d";
 
 /** Medium: longer carry course — crouch grab, low squeeze, sliding ferries + narrow beam. */
 const ferryJob: LevelDef = {
@@ -204,12 +204,12 @@ const ferryJob: LevelDef = {
   deliver: { pos: [0, 1.2, -37.5], size: [2.4, 1.6, 2.4] },
 };
 
-const SLATE_TOP = "#8ea2d8";
-const SLATE_SIDE = "#3d4a73";
-const SNOW = "#dfe8ff";
-const SNOW_SIDE = "#6b7ba6";
-const ICE = "#7ef0e2";
-const ICE_SIDE = "#2b8a80";
+const SLATE_TOP = "#8796b0";
+const SLATE_SIDE = "#3c4758";
+const SNOW = "#d9e0e3";
+const SNOW_SIDE = "#737d86";
+const ICE = "#9bd4cf";
+const ICE_SIDE = "#3d7975";
 
 /** Hard: climb high, unstable ferries, precise place, then a timed sweeper gate. */
 const summitSync: LevelDef = {

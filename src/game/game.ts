@@ -117,6 +117,7 @@ class BodyView {
       return m;
     };
     const team = mat(color);
+    const teamAccent = mat(new THREE.Color(color).offsetHSL(0, 0.08, 0.14).getStyle(), { roughness: 0.58 });
     const skin = mat(SKIN);
     const dark = mat("#2b2d42");
     const white = mat("#ffffff", { roughness: 0.5 });
@@ -187,6 +188,17 @@ class BodyView {
         const badge = new THREE.Mesh(new THREE.CircleGeometry(0.09, 20), white);
         badge.position.set(0, 0.1, -0.125);
         g.add(badge);
+        // A shallow chest plate and collar break up the toy-like silhouette while staying
+        // attached to the physics-driven chest part.
+        const chestPlate = new THREE.Mesh(new RoundedBoxGeometry(spec.size[0] * 1.55, spec.size[1] * 0.95, 0.035, 3, 0.02), teamAccent);
+        chestPlate.position.set(0, 0.02, -0.125);
+        chestPlate.castShadow = !ghost;
+        g.add(chestPlate);
+        const collar = new THREE.Mesh(new THREE.TorusGeometry(Math.max(0.12, spec.size[0] * 0.34), 0.025, 8, 20), teamAccent);
+        collar.rotation.x = Math.PI / 2;
+        collar.position.set(0, spec.size[1] * 0.48, 0);
+        collar.castShadow = !ghost;
+        g.add(collar);
       }
       this.parts.push(g);
       this.root.add(g);
@@ -273,6 +285,55 @@ function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: numbe
   ctx.arcTo(x, y + h, x, y, r);
   ctx.arcTo(x, y, x + w, y, r);
   ctx.closePath();
+}
+
+/** Small, deterministic surface variation keeps the level from looking like a set of flat primitives. */
+function makeSurfaceTexture(hex: string, seed = 1) {
+  const size = 128;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d")!;
+  // Canvas bytes are authored in sRGB. Three's working Color is linear, so
+  // convert it back before writing the color texture to avoid double-darkening.
+  const base = new THREE.Color(hex).convertLinearToSRGB();
+  const image = ctx.createImageData(size, size);
+  let state = (seed * 1664525 + 1013904223) >>> 0;
+  const random = () => {
+    state = (state * 1664525 + 1013904223) >>> 0;
+    return state / 4294967296;
+  };
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      // Subtle low-frequency variation breaks up flat primitives without the
+      // high-contrast, pixelated pattern of a conventional noise texture.
+      const broad = Math.sin(x * 0.075 + seed) * 0.009 + Math.sin(y * 0.052 + seed * 1.7) * 0.007;
+      const grain = (random() - 0.5) * 0.024 + broad;
+      const i = (y * size + x) * 4;
+      image.data[i] = Math.max(0, Math.min(255, Math.round((base.r + grain) * 255)));
+      image.data[i + 1] = Math.max(0, Math.min(255, Math.round((base.g + grain) * 255)));
+      image.data[i + 2] = Math.max(0, Math.min(255, Math.round((base.b + grain) * 255)));
+      image.data[i + 3] = 255;
+    }
+  }
+  ctx.putImageData(image, 0, 0);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.wrapS = THREE.RepeatWrapping;
+  texture.wrapT = THREE.RepeatWrapping;
+  texture.repeat.set(2.5, 2.5);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.minFilter = THREE.LinearMipmapLinearFilter;
+  texture.magFilter = THREE.LinearFilter;
+  texture.anisotropy = 4;
+  return texture;
+}
+
+function makeSurfaceMaterial(hex: string, roughness: number, metalness = 0, seed = 1) {
+  const texture = makeSurfaceTexture(hex, seed);
+  const bump = texture.clone();
+  bump.colorSpace = THREE.NoColorSpace;
+  bump.needsUpdate = true;
+  return new THREE.MeshStandardMaterial({ map: texture, bumpMap: bump, bumpScale: 0.018, color: "#ffffff", roughness, metalness });
 }
 
 /* ---------------------------------- Particles ---------------------------------- */
@@ -442,6 +503,7 @@ export class Game {
   deliverPad: THREE.Mesh | null = null;
   checkpointMeshes: THREE.Mesh[] = [];
   water: THREE.Mesh | null = null;
+  waterMat: THREE.ShaderMaterial | null = null;
   onSnapshot: ((s: Snap) => void) | null = null;
   onBodyEvent: ((ev: BodyEvent) => void) | null = null;
   private readonly scheduledTimeouts = new Set<ReturnType<typeof setTimeout>>();
@@ -465,21 +527,41 @@ export class Game {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.75));
     this.renderer.shadowMap.enabled = true;
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    // In current Three releases PCFShadowMap is the filtered PCF path (the old
+    // PCFSoftShadowMap alias is deprecated).
+    this.renderer.shadowMap.type = THREE.PCFShadowMap;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.05;
+    this.renderer.toneMappingExposure = 1.0;
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.camera = new THREE.PerspectiveCamera(58, 1, 0.1, 300);
-    this.scene.fog = new THREE.Fog(new THREE.Color("#cfe3ff"), 45, 160);
+    this.scene.fog = new THREE.Fog(new THREE.Color("#a7b6b4"), 42, 150);
 
     // sky dome
     const skyGeo = new THREE.SphereGeometry(200, 24, 12);
     const skyMat = new THREE.ShaderMaterial({
       side: THREE.BackSide,
       depthWrite: false,
-      uniforms: { top: { value: new THREE.Color("#3f7fe0") }, mid: { value: new THREE.Color("#8fc2ff") }, bot: { value: new THREE.Color("#e6f1ff") } },
+      uniforms: {
+        top: { value: new THREE.Color("#416684") },
+        mid: { value: new THREE.Color("#8aa5b2") },
+        bot: { value: new THREE.Color("#d8d0bd") },
+        sunDir: { value: new THREE.Vector3(0.45, 0.78, 0.3).normalize() },
+        sunColor: { value: new THREE.Color("#fff0cf") },
+      },
       vertexShader: `varying vec3 vW; void main(){ vW = (modelMatrix * vec4(position,1.0)).xyz; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
-      fragmentShader: `uniform vec3 top; uniform vec3 mid; uniform vec3 bot; varying vec3 vW; void main(){ float h = normalize(vW).y; vec3 c = h > 0.0 ? mix(mid, top, pow(h, 0.7)) : mix(mid, bot, clamp(-h*4.0,0.0,1.0)); gl_FragColor = vec4(c,1.0); }`,
+      fragmentShader: `
+        uniform vec3 top; uniform vec3 mid; uniform vec3 bot; uniform vec3 sunDir; uniform vec3 sunColor;
+        varying vec3 vW;
+        void main(){
+          vec3 dir = normalize(vW); float h = dir.y;
+          vec3 c = h > 0.0 ? mix(mid, top, pow(h, 0.72)) : mix(mid, bot, clamp(-h * 4.0, 0.0, 1.0));
+          float horizon = exp(-abs(h) * 8.0);
+          c = mix(c, c * 1.18 + vec3(0.035, 0.045, 0.07), horizon * 0.28);
+          float sun = pow(max(dot(dir, normalize(sunDir)), 0.0), 240.0);
+          float glow = pow(max(dot(dir, normalize(sunDir)), 0.0), 8.0) * 0.16;
+          c += sunColor * (sun * 1.4 + glow);
+          gl_FragColor = vec4(c, 1.0);
+        }`,
     });
     const sky = new THREE.Mesh(skyGeo, skyMat);
     sky.frustumCulled = false;
@@ -488,6 +570,12 @@ export class Game {
 
     const hemi = new THREE.HemisphereLight("#cfe4ff", "#5f8a4a", 0.75);
     this.scene.add(hemi);
+    const fill = new THREE.DirectionalLight("#a9c8ff", 0.42);
+    fill.position.set(-24, 18, -18);
+    this.scene.add(fill);
+    const rim = new THREE.DirectionalLight("#ffd4b0", 0.3);
+    rim.position.set(-10, 12, 28);
+    this.scene.add(rim);
     this.sun = new THREE.DirectionalLight("#fff4e0", 2.2);
     this.sun.castShadow = true;
     this.sun.shadow.mapSize.set(2048, 2048);
@@ -502,13 +590,57 @@ export class Game {
     this.scene.add(this.sun);
     this.scene.add(this.sun.target);
 
-    // water
-    const water = new THREE.Mesh(new THREE.PlaneGeometry(600, 600, 1, 1), new THREE.MeshStandardMaterial({ color: "#2f8fe0", roughness: 0.25, metalness: 0.1 }));
+    // Water is an inexpensive procedural wave surface. The two overlapping wave
+    // bands and fresnel edge tint give it believable motion without textures.
+    const waterMat = new THREE.ShaderMaterial({
+      uniforms: {
+        time: { value: 0 },
+        waterColor: { value: new THREE.Color("#2b6678") },
+        deepColor: { value: new THREE.Color("#0c3e73") },
+        sunColor: { value: new THREE.Color("#fff1cf") },
+      },
+      vertexShader: `
+        uniform float time; varying vec3 vWorld; varying vec3 vNormal; varying float vWave;
+        void main(){
+          vec3 p = position;
+          float w1 = sin(p.x * 0.12 + time * 0.75) * 0.09;
+          float w2 = sin(p.y * 0.18 - time * 0.48 + p.x * 0.055) * 0.055;
+          float w3 = sin((p.x + p.y) * 0.31 + time * 1.25) * 0.018;
+          float dx = cos(p.x * 0.12 + time * 0.75) * 0.0108
+                   + cos(p.y * 0.18 - time * 0.48 + p.x * 0.055) * 0.003025
+                   + cos((p.x + p.y) * 0.31 + time * 1.25) * 0.00558;
+          float dy = cos(p.y * 0.18 - time * 0.48 + p.x * 0.055) * 0.0099
+                   + cos((p.x + p.y) * 0.31 + time * 1.25) * 0.00558;
+          p.z += w1 + w2 + w3; vWave = w1 + w2 + w3;
+          vec4 world = modelMatrix * vec4(p, 1.0); vWorld = world.xyz;
+          vNormal = normalize(mat3(modelMatrix) * normalize(vec3(-dx, -dy, 1.0)));
+          gl_Position = projectionMatrix * viewMatrix * world;
+        }`,
+      fragmentShader: `
+        uniform vec3 waterColor; uniform vec3 deepColor; uniform vec3 sunColor;
+        varying vec3 vWorld; varying vec3 vNormal; varying float vWave;
+        void main(){
+          vec3 viewDir = normalize(cameraPosition - vWorld);
+          vec3 normal = normalize(vNormal);
+          vec3 lightDir = normalize(vec3(0.45, 0.78, 0.3));
+          float fresnel = pow(1.0 - max(dot(viewDir, normal), 0.0), 3.0);
+          float specular = pow(max(dot(reflect(-lightDir, normal), viewDir), 0.0), 96.0);
+          float ripple = smoothstep(0.01, 0.08, abs(vWave)) * 0.10;
+          vec3 c = mix(deepColor, waterColor, 0.58 + fresnel * 0.34);
+          c += sunColor * (fresnel * 0.18 + ripple + specular * 0.48);
+          gl_FragColor = vec4(c, 0.9);
+        }`,
+      transparent: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    const water = new THREE.Mesh(new THREE.PlaneGeometry(600, 600, 64, 64), waterMat);
     water.rotation.x = -Math.PI / 2;
     water.position.y = -3;
     water.receiveShadow = true;
     this.scene.add(water);
     this.water = water;
+    this.waterMat = waterMat;
 
     this.scene.add(this.levelGroup);
     this.particles = new Particles(this.scene);
@@ -597,14 +729,18 @@ export class Game {
     const L = this.level;
     // per-level sky + water tint (falls back to day blue)
     if (this.skyMat) {
-      const sky = L.sky ?? { top: "#3f7fe0", mid: "#8fc2ff", bot: "#e6f1ff", fog: "#cfe3ff" };
+      const sky = L.sky ?? { top: "#416684", mid: "#8aa5b2", bot: "#d8d0bd", fog: "#a7b6b4" };
       this.skyMat.uniforms.top.value.set(sky.top);
       this.skyMat.uniforms.mid.value.set(sky.mid);
       this.skyMat.uniforms.bot.value.set(sky.bot);
-      this.scene.fog = new THREE.Fog(new THREE.Color(sky.fog), 45, 160);
+      this.scene.fog = new THREE.Fog(new THREE.Color(sky.fog), 42, 150);
     }
     if (this.water) {
-      (this.water.material as THREE.MeshStandardMaterial).color.set(L.water ?? "#2f8fe0");
+      const waterColor = L.water ?? "#2b6678";
+      if (this.waterMat) {
+        this.waterMat.uniforms.waterColor.value.set(waterColor);
+        this.waterMat.uniforms.deepColor.value.copy(new THREE.Color(waterColor).multiplyScalar(0.34));
+      }
       this.water.position.y = L.killY < -3 ? -4 : -3;
     }
     for (const s of L.statics) {
@@ -618,8 +754,8 @@ export class Game {
       const col = this.world.createCollider(R.ColliderDesc.cuboid(s.size[0] / 2, s.size[1] / 2, s.size[2] / 2).setFriction(0.9).setCollisionGroups(groups(GROUP_ENV, 0xffff)), rb);
       if (s.grab === false) this.nonGrabHandles.add(col.handle);
       this.staticBodies.push(rb);
-      const side = new THREE.MeshStandardMaterial({ color: s.color ?? "#999", roughness: 0.85 });
-      const top = new THREE.MeshStandardMaterial({ color: s.top ?? s.color ?? "#bbb", roughness: 0.85 });
+      const side = makeSurfaceMaterial(s.color ?? "#999", 0.82, 0, this.level.id.length * 31 + this.staticBodies.length);
+      const top = makeSurfaceMaterial(s.top ?? s.color ?? "#bbb", 0.7, 0, this.level.id.length * 37 + this.staticBodies.length + 1);
       const mesh = new THREE.Mesh(new THREE.BoxGeometry(s.size[0], s.size[1], s.size[2]), [side, side, top, side, side, side]);
       mesh.position.set(s.pos[0], s.pos[1], s.pos[2]);
       mesh.quaternion.copy(q);
@@ -631,7 +767,7 @@ export class Game {
         // decorative edge stripe
         const stripe = new THREE.Mesh(
           new THREE.BoxGeometry(s.size[0] + 0.02, 0.08, s.size[2] + 0.02),
-          new THREE.MeshStandardMaterial({ color: new THREE.Color(s.top ?? "#fff").multiplyScalar(0.85), roughness: 0.9 })
+          makeSurfaceMaterial(new THREE.Color(s.top ?? "#fff").multiplyScalar(0.85).getStyle(), 0.88, 0, this.staticBodies.length + 11)
         );
         stripe.position.set(s.pos[0], s.pos[1] + s.size[1] / 2 - 0.12, s.pos[2]);
         stripe.quaternion.copy(q);
@@ -1103,10 +1239,15 @@ export class Game {
     this.particles.update(dt);
     // deco animation
     const t = performance.now() / 1000;
+    if (this.waterMat) this.waterMat.uniforms.time.value = t;
     if (this.deliverPad) (this.deliverPad.material as THREE.MeshStandardMaterial).emissiveIntensity = 0.6 + Math.sin(t * 4) * 0.4;
     for (const f of this.checkpointMeshes) f.rotation.y = Math.sin(t * 3 + f.userData.idx) * 0.2;
     this.sun.position.copy(this.camFocus).add(new THREE.Vector3(18, 32, 14));
     this.sun.target.position.copy(this.camFocus);
+    if (this.skyMat) {
+      tmpV.copy(this.sun.position).sub(this.camFocus).normalize();
+      this.skyMat.uniforms.sunDir.value.copy(tmpV);
+    }
     this.hudAcc += dt;
     if (this.hudAcc > 0.1) {
       this.hudAcc = 0;
@@ -1540,6 +1681,14 @@ export class Game {
     const look = tmpV2.copy(this.camFocus).add(tmpV.set(-Math.sin(this.camYaw), 0, -Math.cos(this.camYaw)).multiplyScalar(1.2));
     look.y += 0.2 - this.displayPitch * 0.8;
     this.camera.lookAt(look);
+    // A restrained speed/fall lens change adds weight while preserving the clear
+    // third-person read needed for cooperative physics.
+    const targetFov = this.displayFallen ? 62 : this.running ? 60 : 58;
+    const nextFov = THREE.MathUtils.lerp(this.camera.fov, targetFov, 1 - Math.exp(-dt * 4));
+    if (Math.abs(nextFov - this.camera.fov) > 0.01) {
+      this.camera.fov = nextFov;
+      this.camera.updateProjectionMatrix();
+    }
   }
 
   /* ------------------------------- HUD ------------------------------- */
@@ -1568,7 +1717,7 @@ export class Game {
     this.cancelScheduledTimeouts();
     this.remoteInputBuffer.clear();
     window.removeEventListener("resize", this.resize);
-    this.audio.stopMusic();
+    this.audio.dispose();
     for (const id of [...this.ghosts.keys()]) this.removeGhost(id);
     this.scene.remove(this.view.root);
     this.view.dispose();
