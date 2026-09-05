@@ -1,0 +1,22 @@
+# deps
+node_modules/
+
+# next
+.next/
+out/
+
+# env (never commit secrets)
+.env
+.env*.local
+.env*.development
+.env*.production
+
+# typescript
+*.tsbuildinfo
+
+# vercel
+.vercel/
+
+# os
+.DS_Store
+Thumbs.db
