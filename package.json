@@ -7,7 +7,9 @@
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "next typegen && tsc --noEmit",
-    "test": "tsx scripts/resilience-test.ts"
+    "test": "npm run test:resilience && npm run test:physics",
+    "test:resilience": "tsx scripts/resilience-test.ts",
+    "test:physics": "tsx scripts/physics-reactor-test.ts"
   },
   "dependencies": {
     "@dimforge/rapier3d-compat": "^0.20.0",

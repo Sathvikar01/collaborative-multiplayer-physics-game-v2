@@ -169,19 +169,26 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
       const r = roomRef.current;
       if (!g || !r) return;
       if (m.round !== undefined && m.round !== r.round) return;
+      const authoritativeTeam = r.teams.find((team) => team.id === m.teamId);
+      if (!authoritativeTeam || (m.hostId !== undefined && m.hostId !== authoritativeTeam.hostId)) return;
+      let nextWatermark: { authority: string; seq: number } | null = null;
+      let authorityChanged = false;
       if (typeof m.seq === "number") {
         const authority = `${m.hostId ?? "unknown"}:${m.epoch ?? 0}`;
         const last = stateSeqRef.current.get(m.teamId);
         if (!Number.isSafeInteger(m.seq) || (last?.authority === authority && m.seq <= last.seq)) return;
-        stateSeqRef.current.set(m.teamId, { authority, seq: m.seq });
+        authorityChanged = Boolean(last && last.authority !== authority);
+        nextWatermark = { authority, seq: m.seq };
       }
       const myT = r.players.find((p) => p.id === ids.pid)?.teamId;
+      if (authorityChanged) g.clearSnapshotBuffer(m.teamId);
+      let applied = false;
       if (m.teamId === myT) {
-        if (!g.isHost) g.applyOwnSnapshot(m.state);
+        if (!g.isHost) applied = g.applyOwnSnapshot(m.state);
       } else {
-        const t = r.teams.find((x) => x.id === m.teamId);
-        g.applyGhostSnapshot(m.teamId, t?.color ?? "#999", t?.name ?? "Team", m.state);
+        applied = g.applyGhostSnapshot(m.teamId, authoritativeTeam.color, authoritativeTeam.name, m.state);
       }
+      if (applied && nextWatermark) stateSeqRef.current.set(m.teamId, nextWatermark);
     });
     net.on("finished", (d) => {
       if (sessionGenerationRef.current !== generation) return;
@@ -624,6 +631,12 @@ export default function GameClient({ code, solo }: { code: string; solo: boolean
       {hud && phase !== "lobby" && (
         <div className={`pointer-events-none absolute right-3 z-20 flex max-w-[calc(100vw-1.5rem)] flex-col items-end gap-2 sm:bottom-4 sm:right-4 ${roleCardOpen && currentRole ? "bottom-[max(14.5rem,calc(env(safe-area-inset-bottom)+13.75rem))]" : "bottom-[max(0.75rem,env(safe-area-inset-bottom))]"}`} aria-live="polite">
           {hud.fallen && <div className="animate-pulse rounded-xl bg-[#ff5d5d] px-4 py-2 font-black shadow-lg">FALLEN! Torso: hold SPACE to get up</div>}
+          {!hud.fallen && hud.supportFeet > 0 && hud.stabilityMargin < -0.1 && (
+            <div className="animate-pulse rounded-xl bg-[#ffd23f] px-4 py-2 font-black text-black shadow-lg">UNSTABLE · Torso: counter-lean or brace!</div>
+          )}
+          {hud.gripStress > 0.82 && (
+            <div className="animate-pulse rounded-xl bg-[#ff9a3c] px-4 py-2 font-black text-black shadow-lg">GRIP SLIPPING · Hands: align and share the load!</div>
+          )}
           {hud.hanging && <div className="rounded-xl bg-[#4fa8ff] px-4 py-2 font-black shadow-lg">HANGING · Arms: S to pull up · Legs: step!</div>}
           {hud.holding > 0 && !hud.hanging && <div className="rounded-xl bg-[#6ef29a] text-black px-4 py-2 font-black shadow-lg">HOLDING · Arms: Shift to throw</div>}
           {hud.crouch && <div className="rounded-xl bg-black/50 px-3 py-1 text-sm font-bold">Crouching</div>}

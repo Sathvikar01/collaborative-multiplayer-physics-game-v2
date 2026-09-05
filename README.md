@@ -55,7 +55,7 @@ flowchart LR
   subgraph Browser[Each browser]
     UI[GameClient React UI]
     NET[Net transport\nSSE + bounded HTTP queues]
-    PHYS[Three.js + Rapier\nlocal game simulation]
+    PHYS[PhysicsReactor + Rapier\n120 Hz authoritative simulation]
     INPUT[InputManager]
     UI --> NET
     UI --> PHYS
@@ -165,7 +165,11 @@ Important timings:
 | Disconnect grace | 15 s | Preserves team, role, and session membership for reconnect |
 | Command retry window | 60 s | Retries lost control-command responses with idempotency keys |
 
-Host takeover snapshots include body transforms, body velocities, prop transforms/velocities, mover phase, checkpoint, delivery state, timer, and score. Held joints are not serialized; a takeover can therefore release an object currently being held, but it will not reset the whole course to spawn.
+Host takeover snapshots include body transforms/velocities, prop motion, mover phase, objective state, and a versioned reactor continuation containing limb-controller and logical grip state. A replacement host reconstructs compatible grips instead of unconditionally dropping the carried object.
+
+### Cooperative physics
+
+Five-player hand and leg channels remain independent through the solver. Bilateral grabs attach both hands to the same target, share the load, and accumulate grip strain when the players pull in conflicting directions. Heavy one-hand loads slip and drop. Balance uses foot contact manifolds, whole-body/carried-load center of mass, a predicted capture point, and a support margin; moving both legs without torso correction removes support, while bracing increases limited recovery authority.
 
 ## Repository map
 
@@ -181,7 +185,8 @@ src/
 │     └─ health/route.ts                 Database health check
 ├─ components/GameClient.tsx            React session/UI coordinator
 ├─ game/
-│  ├─ game.ts                            Three.js/Rapier simulation
+│  ├─ game.ts                            Three.js rendering and game flow
+│  ├─ physicsReactor.ts                  Fixed-step seam, diagnostics, takeover state
 │  ├─ body.ts                            Ragdoll and physics controller
 │  ├─ squad.ts                           3P/5P input mixer
 │  ├─ remoteInput.ts                     Expiring remote-input leases
@@ -197,6 +202,7 @@ scripts/
 ├─ route-integration-test.ts             Next route + SSE tests
 ├─ nettest.ts                            Mocked transport/retry tests
 ├─ remoteinputtest.ts                    Input lease/fuzz tests
+├─ physics-reactor-test.ts               Deterministic coordination/physics assertions
 └─ simtest.ts, leveltest.ts, ...         Physics smoke simulations
 ```
 
@@ -267,7 +273,7 @@ Run the focused suite:
 npm test
 ```
 
-It covers stale SSE cleanup, reconnect role preservation, immediate host takeover, authenticated route commands, command idempotency, malformed input/state rejection, input expiry, realtime coalescing, and retry metadata.
+It covers stale SSE cleanup, reconnect role preservation, immediate host takeover, authenticated route commands, command idempotency, malformed input/state rejection, input expiry, realtime coalescing, fixed-step equivalence, contact-derived support, bilateral load sharing, grip failure, balance failure, and reactor snapshot restoration.
 
 For a complete pre-merge check:
 

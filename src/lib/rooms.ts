@@ -242,6 +242,35 @@ export function backToLobby(room: Room) { clearTimers(room); room.phase = "lobby
 
 function finite(value: unknown): value is number { return typeof value === "number" && Number.isFinite(value); }
 function clamp(value: unknown, min: number, max: number, fallback: number) { return finite(value) ? Math.max(min, Math.min(max, value)) : fallback; }
+function finiteTuple(value: unknown, length: number, limit = 1e6) { return Array.isArray(value) && value.length === length && value.every((entry) => finite(entry) && Math.abs(entry) <= limit); }
+/** Bound and structurally validate the optional host-takeover controller state. */
+function safeReactorState(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const reactor = value as Record<string, unknown>;
+  if (reactor.version !== 1 || !finite(reactor.stepHz) || (reactor.stepHz as number) <= 0 || !finite(reactor.fixedStepSeconds) || (reactor.fixedStepSeconds as number) <= 0) return null;
+  if (!Number.isSafeInteger(reactor.tick) || (reactor.tick as number) < 0 || !finite(reactor.accumulatorSeconds) || (reactor.accumulatorSeconds as number) < 0) return null;
+  if (!Array.isArray(reactor.parts) || (reactor.parts.length !== 0 && reactor.parts.length !== 11) || !Array.isArray(reactor.grips) || reactor.grips.length > 2) return null;
+  for (const part of reactor.parts) {
+    if (!part || typeof part !== "object") return null;
+    const p = part as Record<string, unknown>;
+    if (!finiteTuple(p.translation, 3) || !finiteTuple(p.rotation, 4) || !finiteTuple(p.linearVelocity, 3, 1e5) || !finiteTuple(p.angularVelocity, 3, 1e5)) return null;
+  }
+  const gripHands = new Set<number>();
+  for (const grip of reactor.grips) {
+    if (!grip || typeof grip !== "object") return null;
+    const g = grip as Record<string, unknown>;
+    if ((g.hand !== 0 && g.hand !== 1) || gripHands.has(g.hand) || !finite(g.id) || typeof g.isStatic !== "boolean" || !finite(g.mass) || (g.mass as number) < 0 || !finiteTuple(g.localAnchor, 3)) return null;
+    gripHands.add(g.hand);
+  }
+  if (!reactor.controller || typeof reactor.controller !== "object" || Array.isArray(reactor.controller)) return null;
+  try {
+    const encoded = JSON.stringify(reactor);
+    if (encoded.length > 12_000) return null;
+    return JSON.parse(encoded) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
 function sanitizeRoleInput(value: unknown): RoleInput { const x = value && typeof value === "object" ? value as Record<string, unknown> : {}; return { f: clamp(x.f, -1, 1, 0), s: clamp(x.s, -1, 1, 0), a: x.a === true, b: x.b === true, q: x.q === true, e: x.e === true, lx: clamp(x.lx, -Math.PI, Math.PI, 0), ly: clamp(x.ly, -0.9, 0.7, 0) }; }
 function sanitizeInputs(player: Player, inputs: unknown) {
   if (!inputs || typeof inputs !== "object" || Array.isArray(inputs)) return null; const entries = Object.entries(inputs as Record<string, unknown>); if (entries.length > 8) return null;
@@ -255,7 +284,11 @@ export function relayInput(room: Room, playerId: string, sessionToken: string, c
 function safeSnapshot(state: unknown) {
   if (!state || typeof state !== "object" || Array.isArray(state)) return null; const s = state as Record<string, unknown>;
   if (!finite(s.t) || !Array.isArray(s.p) || s.p.length !== SNAP_PARTS || !Array.isArray(s.props) || s.props.length > 256 || s.props.length % 8 !== 0 || !finite(s.yaw) || !finite(s.pitch) || !finite(s.timer) || !finite(s.fallen) || !finite(s.score) || !Array.isArray(s.ev) || s.ev.length > 32) return null;
-  const nums = [...s.p, ...s.props, s.t, s.yaw, s.pitch, s.timer, s.fallen, s.score]; if (!nums.every(finite) || !s.ev.every((e) => e && typeof e === "object" && typeof (e as Record<string, unknown>).type === "string" && ((e as Record<string, unknown>).type as string).length <= 32)) return null;
+  const nums = [...s.p, ...s.props, s.t, s.yaw, s.pitch, s.timer, s.fallen, s.score]; if (!nums.every(finite) || !s.ev.every((e) => {
+    if (!e || typeof e !== "object") return false;
+    const event = e as Record<string, unknown>;
+    return typeof event.type === "string" && event.type.length <= 32 && finiteTuple(event.pos, 3);
+  })) return null;
   const optionalArrays = [s.v, s.av, s.propMotion];
   if (s.v !== undefined && (!Array.isArray(s.v) || s.v.length !== SNAP_VELOCITIES)) return null;
   if (s.av !== undefined && (!Array.isArray(s.av) || s.av.length !== SNAP_VELOCITIES)) return null;
@@ -266,7 +299,8 @@ function safeSnapshot(state: unknown) {
   if (s.delivered !== undefined && typeof s.delivered !== "boolean") return null;
   if (s.running !== undefined && typeof s.running !== "boolean") return null;
   if (s.finished !== undefined && typeof s.finished !== "boolean") return null;
-  const clean = { t: s.t, p: (s.p as number[]).map(Number), v: s.v ? (s.v as number[]).map(Number) : undefined, av: s.av ? (s.av as number[]).map(Number) : undefined, props: (s.props as number[]).map(Number), propMotion: s.propMotion ? (s.propMotion as number[]).map(Number) : undefined, moverT: s.moverT, checkpointIdx: s.checkpointIdx, delivered: s.delivered, running: s.running, finished: s.finished, yaw: s.yaw, pitch: s.pitch, timer: Math.max(0, s.timer as number), fallen: s.fallen, score: s.score, ev: s.ev, msg: typeof s.msg === "string" ? s.msg.slice(0, 256) : undefined };
+  const reactor = s.reactor === undefined ? undefined : safeReactorState(s.reactor); if (s.reactor !== undefined && !reactor) return null;
+  const clean = { t: s.t, p: (s.p as number[]).map(Number), v: s.v ? (s.v as number[]).map(Number) : undefined, av: s.av ? (s.av as number[]).map(Number) : undefined, props: (s.props as number[]).map(Number), propMotion: s.propMotion ? (s.propMotion as number[]).map(Number) : undefined, moverT: s.moverT, checkpointIdx: s.checkpointIdx, delivered: s.delivered, running: s.running, finished: s.finished, yaw: s.yaw, pitch: s.pitch, timer: Math.max(0, s.timer as number), fallen: s.fallen, score: s.score, ev: s.ev, msg: typeof s.msg === "string" ? s.msg.slice(0, 256) : undefined, reactor };
   return JSON.stringify(clean).length <= MAX_STATE_BYTES ? clean : null;
 }
 export function relayState(room: Room, playerId: string, sessionToken: string, connectionId: string, state: unknown, seq = 0) {

@@ -7,6 +7,14 @@ import { GameAudio } from "./audio";
 import type { Role, RoleInput, SquadSize } from "./types";
 import { makeSquadMixState, resolvePhysInputs, type SquadMixState } from "./squad";
 import { RemoteInputBuffer, normalizeRemoteInputs } from "./remoteInput";
+import {
+  PhysicsReactor,
+  isPhysicsReactorSnapshot,
+  type ContactForceEvent as ReactorContactForceEvent,
+  type PhysicsDiagnostics,
+  type PhysicsReactorSnapshot,
+  type ReactorStepResult,
+} from "./physicsReactor";
 
 type R = typeof RAPIER_T;
 let RAPIER: R | null = null;
@@ -40,6 +48,8 @@ export interface Snap {
   score: number;
   ev: (BodyEvent | { type: string; pos: [number, number, number] })[];
   msg?: string;
+  /** Versioned active-ragdoll/controller state used during host takeover. */
+  reactor?: PhysicsReactorSnapshot;
 }
 
 export interface HudState {
@@ -54,6 +64,10 @@ export interface HudState {
   objective: string;
   running: boolean;
   finished: boolean;
+  stabilityMargin: number;
+  supportFeet: number;
+  gripStress: number;
+  fallReason: string | null;
 }
 
 export type GameEvent = { type: "finish"; timeMs: number } | { type: "message"; text: string; tone?: "good" | "bad" | "info" } | { type: "hud"; hud: HudState } | { type: "shout"; teamId: number };
@@ -454,8 +468,12 @@ export class Game {
   levelGroup = new THREE.Group();
   staticBodies: RigidBodyT[] = [];
   nonGrabHandles = new Set<number>();
+  staticGrabIdByCollider = new Map<number, number>();
+  staticGrabBodyById = new Map<number, RigidBodyT>();
   props: Prop[] = [];
   body: RagdollBody | null = null;
+  reactor: PhysicsReactor | null = null;
+  physicsDiagnostics: PhysicsDiagnostics | null = null;
   view: BodyView;
   ghosts = new Map<number, TeamGhost>();
   ownBuffer: { recv: number; snap: Snap }[] = [];
@@ -485,7 +503,6 @@ export class Game {
   timer = 0;
   score = 0;
   checkpointIdx = -1;
-  accumulator = 0;
   lastFrame = 0;
   raf = 0;
   fixedDt = 1 / 120;
@@ -700,6 +717,8 @@ export class Game {
     this.cancelScheduledTimeouts();
     this.level = getLevel(levelId);
     // reset physics world entirely
+    this.reactor?.dispose();
+    this.reactor = null;
     if (this.body) this.body.dispose();
     if (this.eventQueue) this.eventQueue.free();
     if (this.world) this.world.free();
@@ -708,8 +727,11 @@ export class Game {
     this.world.timestep = this.fixedDt;
     this.eventQueue = new R.EventQueue(true);
     this.body = null;
+    this.physicsDiagnostics = null;
     this.staticBodies = [];
     this.nonGrabHandles.clear();
+    this.staticGrabIdByCollider.clear();
+    this.staticGrabBodyById.clear();
     this.props = [];
     disposeObject3D(this.levelGroup);
     this.levelGroup.clear();
@@ -753,7 +775,12 @@ export class Game {
       const rb = this.world.createRigidBody(desc);
       const col = this.world.createCollider(R.ColliderDesc.cuboid(s.size[0] / 2, s.size[1] / 2, s.size[2] / 2).setFriction(0.9).setCollisionGroups(groups(GROUP_ENV, 0xffff)), rb);
       if (s.grab === false) this.nonGrabHandles.add(col.handle);
+      const staticGripId = -1 - this.staticBodies.length;
       this.staticBodies.push(rb);
+      if (s.grab !== false) {
+        this.staticGrabIdByCollider.set(col.handle, staticGripId);
+        this.staticGrabBodyById.set(staticGripId, rb);
+      }
       const side = makeSurfaceMaterial(s.color ?? "#999", 0.82, 0, this.level.id.length * 31 + this.staticBodies.length);
       const top = makeSurfaceMaterial(s.top ?? s.color ?? "#bbb", 0.7, 0, this.level.id.length * 37 + this.staticBodies.length + 1);
       const mesh = new THREE.Mesh(new THREE.BoxGeometry(s.size[0], s.size[1], s.size[2]), [side, side, top, side, side, side]);
@@ -963,10 +990,25 @@ export class Game {
 
   /* ------------------------------- Body ------------------------------- */
   spawnBody(pos: THREE.Vector3, yaw: number) {
+    this.reactor?.dispose();
+    this.reactor = null;
     if (this.body) this.body.dispose();
     this.body = new RagdollBody(this.R, this.world, pos, yaw);
     this.body.findGrab = (hp, exclude) => this.findGrab(hp, exclude);
     this.body.inputs.head.lx = yaw;
+    this.reactor = new PhysicsReactor({
+      rapier: this.R,
+      world: this.world,
+      eventQueue: this.eventQueue,
+      body: this.body,
+      stepHz: 1 / this.fixedDt,
+      maxSubsteps: 12,
+      maxDebtSeconds: 0.25,
+      resolveGripTargetHandle: (grip) => {
+        if (grip.isStatic) return this.staticGrabBodyById.get(grip.id)?.handle;
+        return this.props.find((prop) => prop.id === grip.id)?.body?.handle;
+      },
+    });
   }
 
   setHost(isHost: boolean) {
@@ -980,7 +1022,7 @@ export class Game {
       const yaw = last?.yaw ?? this.level.spawnYaw;
       const wasRunning = last?.running ?? this.running;
       this.setLevel(this.level.id);
-      this.spawnBody(new THREE.Vector3(...this.level.spawn), yaw);
+      if (!this.body) this.spawnBody(new THREE.Vector3(...this.level.spawn), yaw);
       if (last) this.restoreTakeoverSnapshot(last);
       this.timer = last?.timer ?? this.timer;
       this.score = last?.score ?? this.score;
@@ -990,8 +1032,11 @@ export class Game {
       if (this.body) this.body.frozen = this.frozen;
       this.remoteInputBuffer.clear();
     } else {
+      this.reactor?.dispose();
+      this.reactor = null;
       if (this.body) this.body.dispose();
       this.body = null;
+      this.physicsDiagnostics = null;
     }
   }
 
@@ -1047,6 +1092,7 @@ export class Game {
       m.rb.setLinvel({ x: 0, y: 0, z: 0 }, true);
       m.mesh.position.set(x, m.base.y, z);
     }
+    if (s.reactor) this.reactor?.restore(s.reactor);
   }
 
   private findGrab(hp: THREE.Vector3, exclude: number[]): GrabTarget | null {
@@ -1068,7 +1114,14 @@ export class Game {
       }
     }
     if (best) return best;
-    return findStaticGrab(this.R, this.world, hp, this.body?.heading ?? 0, (h) => !this.nonGrabHandles.has(h));
+    return findStaticGrab(
+      this.R,
+      this.world,
+      hp,
+      this.body?.heading ?? 0,
+      (handle) => !this.nonGrabHandles.has(handle),
+      (handle) => this.staticGrabIdByCollider.get(handle),
+    );
   }
 
   /* ------------------------------- Inputs ------------------------------- */
@@ -1090,6 +1143,8 @@ export class Game {
   /* ------------------------------- Flow ------------------------------- */
   prepareRun() {
     // teleport to spawn, freeze, reset props and state
+    this.ownBuffer = [];
+    for (const ghost of this.ghosts.values()) ghost.buffer = [];
     this.finished = false;
     this.running = false;
     this.timer = 0;
@@ -1111,6 +1166,7 @@ export class Game {
     }
     if (this.isHost && this.body) {
       this.body.teleport(new THREE.Vector3(...this.level.spawn), this.level.spawnYaw);
+      this.reactor?.resetClock(true);
       for (const p of this.props) this.resetProp(p);
       this.body.frozen = true;
     }
@@ -1175,19 +1231,16 @@ export class Game {
 
   private frame(dt: number) {
     if (this.isHost && this.body) {
-      // merge squad inputs (3P/5P) into the 5 physics channels
+      // Merge squad input without collapsing the two hand players into one
+      // channel. The reactor owns all fixed substeps from this point onward.
       // Expired remote leases become neutral input before they reach the mixer.
       const merged: Partial<Record<Role, RoleInput>> = { ...this.remoteInputBuffer.getMerged(), ...this.localInputs };
       const phys = resolvePhysInputs(merged, this.squadSize, Math.min(dt, 0.1), this.squadMix);
-      Object.assign(this.body.inputs, phys);
-      this.accumulator += dt;
-      let steps = 0;
-      while (this.accumulator >= this.fixedDt && steps < 5) {
-        this.stepPhysics(this.fixedDt);
-        this.accumulator -= this.fixedDt;
-        steps++;
-      }
-      if (steps === 5) this.accumulator = 0;
+      const reactorFrame = this.reactor?.advance(dt, phys, {
+        beforeStep: ({ dt: stepDt }) => this.beforePhysicsStep(stepDt),
+        afterStep: ({ dt: stepDt }, stepResult) => this.afterPhysicsStep(stepDt, stepResult),
+      });
+      this.physicsDiagnostics = reactorFrame?.diagnostics ?? null;
       this.body.writeTransforms(this.displayTransforms);
       this.displayYaw = this.body.heading;
       this.displayPitch = this.body.headPitch;
@@ -1262,9 +1315,9 @@ export class Game {
     return Math.atan2(-tmpV.x, -tmpV.z);
   }
 
-  private stepPhysics(dt: number) {
-    const body = this.body!;
-    // kinematic movers (ferries / timing gates) — ponytail: velocity-based so riders get carried
+  private beforePhysicsStep(dt: number) {
+    // Kinematic movers (ferries / timing gates) are velocity-based so riders
+    // receive a real contact impulse from Rapier.
     if (this.movers.length > 0) {
       this.moverT += dt;
       for (const m of this.movers) {
@@ -1275,44 +1328,41 @@ export class Game {
         m.rb.setLinvel({ x: (nx - cur.x) / dt, y: 0, z: (nz - cur.z) / dt }, true);
       }
     }
-    body.update(dt);
-    // props cooldown
     for (const p of this.props) p.cooldown = Math.max(0, p.cooldown - dt);
     this.denyCooldown = Math.max(0, this.denyCooldown - dt);
-    this.world.step(this.eventQueue);
+  }
+
+  private afterPhysicsStep(dt: number, result: ReactorStepResult) {
     if (this.running && !this.finished) this.timer += dt;
-    // body events
-    for (const ev of body.events) this.handleBodyEvent(ev, true);
-    // contact force events
-    this.eventQueue.drainContactForceEvents((ev) => {
-      const h1 = ev.collider1();
-      const h2 = ev.collider2();
-      const f = ev.totalForceMagnitude();
-      const c1 = this.world.getCollider(h1);
-      const c2 = this.world.getCollider(h2);
-      if (!c1 || !c2) return;
-      const bodyPart = body.colliderHandles.has(h1) || body.colliderHandles.has(h2);
-      const prop = this.props.find((p) => p.colliderHandle === h1 || p.colliderHandle === h2);
-      const other = body.colliderHandles.has(h1) ? c2 : c1;
-      const t = other.translation();
-      const pos: [number, number, number] = bodyPart ? (() => {
-        const bc = body.colliderHandles.has(h1) ? c1 : c2;
-        const bt = bc.translation();
-        return [bt.x, bt.y, bt.z];
-      })() : [t.x, t.y, t.z];
-      if (prop?.def.fragile && f > (this.level.fragileForce ?? 900) && prop.cooldown <= 0) {
-        const heldByUs = body.isHolding(prop.id) && bodyPart;
-        if (!heldByUs) {
-          this.breakProp(prop);
-          return;
-        }
-      }
-      if (bodyPart && f > 500) this.handleLevelEvent({ type: "thud", pos, force: Math.min(1, f / 1500) }, true);
-      else if (prop && f > 250) this.handleLevelEvent({ type: "bounce", pos, force: Math.min(1, f / 1200) }, true);
-    });
-    this.eventQueue.drainCollisionEvents(() => {});
-    // objectives
+    for (const ev of result.bodyEvents) this.handleBodyEvent(ev, true);
+    for (const event of result.contactForceEvents) this.handleContactForceEvent(event);
     this.checkObjectives();
+  }
+
+  private handleContactForceEvent(ev: ReactorContactForceEvent) {
+    const body = this.body;
+    if (!body) return;
+    const h1 = ev.collider1;
+    const h2 = ev.collider2;
+    const f = ev.totalForceMagnitude;
+    const c1 = this.world.getCollider(h1);
+    const c2 = this.world.getCollider(h2);
+    if (!c1 || !c2) return;
+    const bodyPart = ev.involvesBody;
+    const prop = this.props.find((p) => p.colliderHandle === h1 || p.colliderHandle === h2);
+    const fallback = (body.colliderHandles.has(h1) ? c1 : body.colliderHandles.has(h2) ? c2 : prop?.colliderHandle === h1 ? c1 : c2).translation();
+    const pos: [number, number, number] = ev.position
+      ? [ev.position[0], ev.position[1], ev.position[2]]
+      : [fallback.x, fallback.y, fallback.z];
+    if (prop?.def.fragile && f > (this.level.fragileForce ?? 900) && prop.cooldown <= 0) {
+      const heldByUs = body.isHolding(prop.id) && bodyPart;
+      if (!heldByUs) {
+        this.breakProp(prop);
+        return;
+      }
+    }
+    if (bodyPart && f > 500) this.handleLevelEvent({ type: "thud", pos, force: Math.min(1, f / 1500) }, true);
+    else if (prop && f > 250) this.handleLevelEvent({ type: "bounce", pos, force: Math.min(1, f / 1200) }, true);
   }
 
   private breakProp(p: Prop) {
@@ -1333,6 +1383,7 @@ export class Game {
       const spawn = cp?.spawn ? new THREE.Vector3(...cp.spawn) : new THREE.Vector3(...L.spawn);
       this.handleLevelEvent({ type: "splash", pos: [pp.x, -3, pp.z] }, true);
       body.teleport(spawn, L.spawnYaw);
+      this.reactor?.resetClock();
       this.message("SPLASH! Back to the last checkpoint.", "bad");
     }
     for (const p of this.props) {
@@ -1441,6 +1492,15 @@ export class Game {
         break;
       case "release":
         a.release();
+        break;
+      case "slip":
+        a.release();
+        this.particles.emit(p, 7, { color: ["#ffd23f", "#ffffff"], speed: 1.1, up: 0.5, size: 0.05, life: 0.35 });
+        this.shake = Math.max(this.shake, 0.08);
+        break;
+      case "drop":
+        a.fall();
+        this.particles.emit(p, 10, { color: ["#ff9a3c", "#ffffff"], speed: 1.5, up: 0.8, size: 0.06, life: 0.45 });
         break;
       case "throw":
         a.whoosh();
@@ -1558,13 +1618,16 @@ export class Game {
       score: this.score,
       ev: this.pendingEvents,
       msg: this.pendingMsg,
+      // Body transforms/velocities already live in p/v/av. Keep only the
+      // compact controller/grip continuation state on the 15 Hz wire path.
+      reactor: this.reactor?.capture(false),
     };
   }
 
   /** Snapshot from own team's host (when this client is not the host). */
   applyOwnSnapshot(raw: Snap) {
     const s = validateSnapshot(raw);
-    if (!s) return;
+    if (!s) return false;
     const now = performance.now();
     this.ownBuffer.push({ recv: now, snap: s });
     while (this.ownBuffer.length > 12) this.ownBuffer.shift();
@@ -1573,6 +1636,18 @@ export class Game {
     this.displayYaw = s.yaw;
     this.displayPitch = s.pitch;
     this.displayFallen = s.fallen === 1;
+    this.displayHolding = s.reactor?.grips.length ?? 0;
+    if (Number.isFinite(s.moverT)) {
+      this.moverT = s.moverT!;
+      for (const mover of this.movers) {
+        const offset = Math.sin(this.moverT * mover.speed + mover.phase) * mover.dist;
+        mover.mesh.position.set(
+          mover.base.x + (mover.axis === "x" ? offset : 0),
+          mover.base.y,
+          mover.base.z + (mover.axis === "z" ? offset : 0),
+        );
+      }
+    }
     for (const ev of s.ev) {
       if (isBodyEvent(ev)) this.handleBodyEvent(ev, false);
       else this.handleLevelEvent(ev, false);
@@ -1581,11 +1656,12 @@ export class Game {
       const [tone, ...rest] = s.msg.split("|");
       this.onEvent({ type: "message", text: rest.join("|"), tone: tone as "good" | "bad" | "info" });
     }
+    return true;
   }
 
   applyGhostSnapshot(teamId: number, color: string, name: string, raw: Snap) {
     const s = validateSnapshot(raw);
-    if (!s) return;
+    if (!s) return false;
     let g = this.ghosts.get(teamId);
     if (!g) {
       const view = new BodyView(color, true, name);
@@ -1596,6 +1672,7 @@ export class Game {
     g.buffer.push({ recv: performance.now(), snap: s });
     while (g.buffer.length > 12) g.buffer.shift();
     for (const ev of s.ev) if (ev.type === "shout") g.view.shout(["HEY!", "MOVE!", "LOL", "NOOO", "FASTER!"][Math.floor(Math.random() * 5)]);
+    return true;
   }
 
   removeGhost(teamId: number) {
@@ -1604,6 +1681,13 @@ export class Game {
     this.scene.remove(g.view.root);
     g.view.dispose();
     this.ghosts.delete(teamId);
+  }
+
+  /** Prevent interpolation across two different host authority epochs. */
+  clearSnapshotBuffer(teamId: number) {
+    if (teamId === this.teamId) this.ownBuffer = [];
+    const ghost = this.ghosts.get(teamId);
+    if (ghost) ghost.buffer = [];
   }
 
   private applyInterpolated(buffer: { recv: number; snap: Snap }[], out: number[], withProps: boolean): boolean {
@@ -1693,20 +1777,36 @@ export class Game {
 
   /* ------------------------------- HUD ------------------------------- */
   private emitHud() {
+    const remoteReactor = this.ownBuffer[this.ownBuffer.length - 1]?.snap.reactor;
+    const remoteController = remoteReactor?.controller;
+    const localGripStress = this.physicsDiagnostics?.gripStress;
+    const remoteGripStress = remoteController?.gripStress;
+    const gripStress = localGripStress
+      ? Math.max(localGripStress[0], localGripStress[1])
+      : remoteGripStress
+        ? Math.max(remoteGripStress[0], remoteGripStress[1])
+        : 0;
+    const supportFeet = this.physicsDiagnostics?.supportContacts
+      ?? remoteController?.supportFeet?.filter(Boolean).length
+      ?? 0;
     this.onEvent({
       type: "hud",
       hud: {
         timer: this.timer,
         fallen: this.displayFallen,
-        holding: this.displayHolding,
+        holding: this.body ? this.body.holds.length : remoteReactor?.grips.length ?? this.displayHolding,
         score: this.score,
         scoreTarget: this.level.targetScore ?? 0,
-        crouch: this.body ? this.body.crouch > 0.5 : false,
-        brace: this.body ? this.body.braceStamina : 1,
-        hanging: this.body ? this.body.holds.some((h) => h.isStatic) : false,
+        crouch: this.body ? this.body.crouch > 0.5 : (remoteController?.crouch ?? 0) > 0.5,
+        brace: this.body ? this.body.braceStamina : remoteController?.braceStamina ?? 1,
+        hanging: this.body ? this.body.holds.some((h) => h.isStatic) : remoteReactor?.grips.some((grip) => grip.isStatic) ?? false,
         objective: this.level.objective,
         running: this.running,
         finished: this.finished,
+        stabilityMargin: this.physicsDiagnostics?.stabilityMargin ?? remoteController?.stabilityMargin ?? 0,
+        supportFeet,
+        gripStress,
+        fallReason: this.physicsDiagnostics?.fallReason ?? remoteController?.fallReason ?? null,
       },
     });
   }
@@ -1723,6 +1823,8 @@ export class Game {
     this.view.dispose();
     disposeObject3D(this.scene);
     this.renderer.dispose();
+    this.reactor?.dispose();
+    this.reactor = null;
     if (this.body) this.body.dispose();
     this.eventQueue?.free();
     this.world?.free();
@@ -1787,6 +1889,7 @@ function validateSnapshot(value: unknown): Snap | null {
   if (raw.moverT !== undefined && (typeof raw.moverT !== "number" || !Number.isFinite(raw.moverT) || Math.abs(raw.moverT) > 1e6)) return null;
   if (raw.checkpointIdx !== undefined && (typeof raw.checkpointIdx !== "number" || !Number.isInteger(raw.checkpointIdx))) return null;
   for (const key of ["delivered", "running", "finished"]) if (raw[key] !== undefined && typeof raw[key] !== "boolean") return null;
+  if (raw.reactor !== undefined && !isPhysicsReactorSnapshot(raw.reactor, PART_COUNT)) return null;
   return {
     t: raw.t as number,
     p: [...raw.p],
@@ -1806,6 +1909,7 @@ function validateSnapshot(value: unknown): Snap | null {
     score: raw.score as number,
     ev: raw.ev as Snap["ev"],
     msg: typeof raw.msg === "string" && raw.msg.length <= 512 ? raw.msg : undefined,
+    reactor: raw.reactor as PhysicsReactorSnapshot | undefined,
   };
 }
 
@@ -1814,5 +1918,5 @@ function inZone(p: THREE.Vector3, z: ZoneDef) {
 }
 
 function isBodyEvent(ev: { type: string }): ev is BodyEvent {
-  return ["step", "land", "grab", "release", "throw", "fall", "getup", "jump", "kick", "shout", "climb"].includes(ev.type);
+  return ["step", "land", "grab", "release", "throw", "fall", "getup", "jump", "kick", "shout", "climb", "slip", "drop"].includes(ev.type);
 }
