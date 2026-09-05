@@ -17,6 +17,9 @@ out/
 # vercel
 .vercel/
 
+# local browser QA state
+.playwright-cli/
+
 # os
 .DS_Store
 Thumbs.db
