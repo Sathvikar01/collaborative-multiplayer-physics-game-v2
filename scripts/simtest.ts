@@ -36,6 +36,7 @@ async function main() {
   // walk: alternate legs at 2.4 Hz
   const period = 0.42;
   let t0 = body.time;
+  body.inputs.torso.a = true; // torso player braces while the legs establish rhythm
   run(6, () => {
     const t = body.time - t0;
     const phase = (t % (period * 2)) / period;
@@ -46,6 +47,7 @@ async function main() {
   });
   body.inputs.lleg.f = 0;
   body.inputs.rleg.f = 0;
+  body.inputs.torso.a = false;
   report("walk 6s (expect -z)");
   run(1.5);
   report("stop 1.5s");
@@ -54,6 +56,7 @@ async function main() {
   run(1.5);
   report("turned");
   t0 = body.time;
+  body.inputs.torso.a = true;
   run(3, () => {
     const t = body.time - t0;
     const phase = (t % (period * 2)) / period;
@@ -64,6 +67,7 @@ async function main() {
   });
   body.inputs.lleg.f = 0;
   body.inputs.rleg.f = 0;
+  body.inputs.torso.a = false;
   report("walk -x 3s (expect -x)");
   // crouch
   body.inputs.torso.b = true;
@@ -118,6 +122,7 @@ async function main() {
   body.teleport(new THREE.Vector3(0, 0, -4), 0);
   run(1);
   t0 = body.time;
+  body.inputs.torso.a = true;
   run(5, () => {
     const t = body.time - t0;
     const phase = (t % (period * 2)) / period;
@@ -128,6 +133,7 @@ async function main() {
   });
   body.inputs.lleg.f = 0;
   body.inputs.rleg.f = 0;
+  body.inputs.torso.a = false;
   report("hurdle walk (expect z<-6)");
 }
 main().catch((e) => {

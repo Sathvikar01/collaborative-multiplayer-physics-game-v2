@@ -13,6 +13,9 @@ async function main() {
     world.createCollider(RAPIER.ColliderDesc.cuboid(s.size[0] / 2, s.size[1] / 2, s.size[2] / 2).setFriction(0.9).setCollisionGroups(groups(GROUP_ENV, 0xffff)), rb);
   }
   const body = new RagdollBody(RAPIER, world, new THREE.Vector3(...L.spawn), L.spawnYaw);
+  // Level traversal represents a coordinated team: the torso player braces
+  // while the leg players alternate their steps.
+  body.inputs.torso.a = true;
   const period = 0.42; let t0 = 0;
   const walk = (sec: number) => { const n = Math.round(sec / dt); for (let i = 0; i < n; i++) { const t = body.time - t0; const ph = (t % (period * 2)) / period; const leg = ph < 1 ? 0 : 1; const pr = (ph % 1) < 0.6; body.inputs.lleg.f = leg === 0 && pr ? 1 : 0; body.inputs.rleg.f = leg === 1 && pr ? 1 : 0; body.update(dt); world.step(); if (body.pelvisPos().y < L.killY) { console.log("  FELL in water at z=", body.pelvisPos().z.toFixed(1)); return false; } } return true; };
   const rep = (l: string) => { const p = body.pelvisPos(); console.log(l.padEnd(10), `pelvis=(${p.x.toFixed(2)},${p.y.toFixed(2)},${p.z.toFixed(2)}) fallen=${body.fallen} gd=${body.groundDist.toFixed(2)}`); };

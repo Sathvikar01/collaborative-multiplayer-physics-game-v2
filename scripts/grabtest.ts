@@ -29,14 +29,20 @@ async function main() {
   const run = (sec: number, fn?: (t: number) => void) => { const n = Math.round(sec / dt); for (let i = 0; i < n; i++) { fn?.(i * dt); body.update(dt); world.step(); } };
   const rep = (l: string) => { const p = body.pelvisPos(); const b = ballBody.translation(); console.log(l.padEnd(26), `pelvis=(${p.x.toFixed(2)},${p.y.toFixed(2)},${p.z.toFixed(2)}) ball=(${b.x.toFixed(2)},${b.y.toFixed(2)},${b.z.toFixed(2)}) holds=${body.holds.length} hand=${body.handPos(0).y.toFixed(2)} fallen=${body.fallen} events=${body.events.map(e=>e.type).join(',')}`); };
   run(1); rep("idle");
-  body.inputs.arms.f = 1; run(0.14); body.inputs.arms.f = 0; body.inputs.torso.b = true; run(1.0); rep("crouch, arms fwd");
-  body.inputs.arms.a = true; run(0.5); rep("grab pressed");
-  body.inputs.torso.b = false; body.inputs.arms.f = 1; run(1.0); body.inputs.arms.f = 0; run(1); rep("stand w/ ball, arms up");
+  body.inputs.lhand.f = -1; body.inputs.rhand.f = -1; run(0.2); body.inputs.lhand.f = 0; body.inputs.rhand.f = 0; body.inputs.torso.b = true; run(1.0); rep("crouch, hands low");
+  const handMid = body.handPos(0).add(body.handPos(1)).multiplyScalar(0.5);
+  ballBody.setTranslation({ x: handMid.x, y: handMid.y, z: handMid.z }, true);
+  ballBody.setLinvel({ x: 0, y: 0, z: 0 }, true);
+  ballBody.setAngvel({ x: 0, y: 0, z: 0 }, true);
+  body.inputs.torso.a = true;
+  body.inputs.lhand.a = true; body.inputs.rhand.a = true; run(0.5); rep("grab pressed");
+  body.inputs.torso.b = false; body.inputs.lhand.f = 1; body.inputs.rhand.f = 1; run(0.35); body.inputs.lhand.f = 0; body.inputs.rhand.f = 0; run(0.4); rep("stand w/ ball, chest carry");
   // walk with ball
+  body.inputs.torso.a = true;
   const period = 0.42; let t0 = body.time;
-  run(2, () => { const t = body.time - t0; const ph = (t % (period * 2)) / period; const leg = ph < 1 ? 0 : 1; const pr = (ph % 1) < 0.6; body.inputs.lleg.f = leg === 0 && pr ? 1 : 0; body.inputs.rleg.f = leg === 1 && pr ? 1 : 0; });
-  body.inputs.lleg.f = 0; body.inputs.rleg.f = 0; run(0.5); rep("walked w/ ball");
-  body.inputs.arms.b = true; run(0.05); rep("throw"); body.inputs.arms.b = false; body.inputs.arms.a = false;
+  run(1.2, () => { const t = body.time - t0; const ph = (t % (period * 2)) / period; const leg = ph < 1 ? 0 : 1; const pr = (ph % 1) < 0.6; body.inputs.lleg.f = leg === 0 && pr ? 1 : 0; body.inputs.rleg.f = leg === 1 && pr ? 1 : 0; });
+  body.inputs.lleg.f = 0; body.inputs.rleg.f = 0; body.inputs.torso.a = false; run(0.5); rep("walked w/ ball");
+  body.inputs.lhand.b = true; body.inputs.rhand.b = true; run(0.05); rep("throw"); body.inputs.lhand.b = false; body.inputs.rhand.b = false; body.inputs.lhand.a = false; body.inputs.rhand.a = false;
   const v = ballBody.linvel(); console.log("ball vel", v.x.toFixed(2), v.y.toFixed(2), v.z.toFixed(2));
   run(1.5); rep("after throw");
   // climbing: walk to wall at z=-2 (wall front face at z=-2)
@@ -44,12 +50,12 @@ async function main() {
   body.teleport(new THREE.Vector3(0, 0, -0.8), 0); run(0.5);
   { const period = 0.42; const t1 = body.time; run(3, () => { const t = body.time - t1; const ph = (t % (period * 2)) / period; const leg = ph < 1 ? 0 : 1; const pr = (ph % 1) < 0.6; body.inputs.lleg.f = leg === 0 && pr ? 1 : 0; body.inputs.rleg.f = leg === 1 && pr ? 1 : 0; }); body.inputs.lleg.f = 0; body.inputs.rleg.f = 0; run(1); rep("scramble (want y~1.03)"); }
   body.teleport(new THREE.Vector3(0, 0, Number(process.env.APPROACH ?? -1.3)), 0); run(0.5);
-  body.inputs.arms.f = 1; run(Number(process.env.RAISE ?? 0.4)); body.inputs.arms.f = 0; run(0.6); rep("arms up at wall");
+  body.inputs.lhand.f = 1; body.inputs.rhand.f = 1; run(Number(process.env.RAISE ?? 0.4)); body.inputs.lhand.f = 0; body.inputs.rhand.f = 0; run(0.6); rep("arms up at wall");
   console.log("hand pos", body.handPos(0).toArray().map(n=>n.toFixed(2)).join(','), "wall top 1.3, wall front z=-2");
-  body.inputs.arms.a = true; run(0.3); rep("grab ledge");
-  body.inputs.arms.f = -1; run(1.0); rep("pull up 1.0s"); run(1.0); rep("pull up 2.0s");
+  body.inputs.lhand.a = true; body.inputs.rhand.a = true; run(0.3); rep("grab ledge");
+  body.inputs.lhand.f = -1; body.inputs.rhand.f = -1; run(1.0); rep("pull up 1.0s"); run(1.0); rep("pull up 2.0s");
   body.inputs.lleg.f = 1; run(0.4); body.inputs.lleg.f = 0; body.inputs.rleg.f = 1; run(0.4); body.inputs.rleg.f = 0; rep("stepping");
   body.inputs.torso.f = 1; run(1.0); rep("lean fwd"); run(1.5); rep("more");
-  body.inputs.arms.a = false; body.inputs.arms.f = 0; body.inputs.torso.f = 0; run(1.5); rep("released (on top? y~2.3)");
+  body.inputs.lhand.a = false; body.inputs.rhand.a = false; body.inputs.lhand.f = 0; body.inputs.rhand.f = 0; body.inputs.torso.f = 0; run(1.5); rep("released (on top? y~2.3)");
 }
 main();

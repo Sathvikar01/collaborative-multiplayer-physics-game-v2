@@ -1,4 +1,4 @@
-export const PHYS_ROLES = ["head", "arms", "torso", "lleg", "rleg"] as const;
+export const PHYS_ROLES = ["head", "lhand", "rhand", "torso", "lleg", "rleg"] as const;
 export type PhysRole = (typeof PHYS_ROLES)[number];
 
 // Squad roles players actually pick. 3-player: arms+torso+legs. 5-player: split hands + split legs.
@@ -49,10 +49,10 @@ export const ROLE_INFO: Record<Role, { label: string; short: string; emoji: stri
     label: "Left Hand",
     short: "L HAND",
     emoji: "🤚",
-    blurb: "Own the left hand. BOTH hands must hold Space to two-hand grab; Q grabs left alone.",
+    blurb: "Own the left hand. Align with the right hand to share heavy loads; fighting it twists or drops them.",
     keys: [
-      { key: "W S", does: "Raise / lower (averages with right hand)" },
-      { key: "A D", does: "Swing (averages with right hand)" },
+      { key: "W S", does: "Raise / lower your hand independently" },
+      { key: "A D", does: "Swing — mismatch twists the load" },
       { key: "Space", does: "Two-hand grab (needs BOTH players)" },
       { key: "Q", does: "Grab left hand alone" },
       { key: "Shift", does: "THROW (needs BOTH players)" },
@@ -62,10 +62,10 @@ export const ROLE_INFO: Record<Role, { label: string; short: string; emoji: stri
     label: "Right Hand",
     short: "R HAND",
     emoji: "✋",
-    blurb: "Own the right hand. BOTH hands must hold Space to two-hand grab; E grabs right alone.",
+    blurb: "Own the right hand. Align with the left hand to share heavy loads; fighting it twists or drops them.",
     keys: [
-      { key: "W S", does: "Raise / lower (averages with right hand)" },
-      { key: "A D", does: "Swing (averages with right hand)" },
+      { key: "W S", does: "Raise / lower your hand independently" },
+      { key: "A D", does: "Swing — mismatch twists the load" },
       { key: "Space", does: "Two-hand grab (needs BOTH players)" },
       { key: "E", does: "Grab right hand alone" },
       { key: "Shift", does: "THROW (needs BOTH players)" },

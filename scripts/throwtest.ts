@@ -23,11 +23,11 @@ async function main() {
   const run = (sec: number) => { const n = Math.round(sec / dt); for (let i = 0; i < n; i++) { body.update(dt); world.step(); } };
   const rep = (l: string) => { const p = body.pelvisPos(); const b = ballBody.translation(); const v = ballBody.linvel(); console.log(l.padEnd(22), `pelvis=(${p.x.toFixed(2)},${p.y.toFixed(2)},${p.z.toFixed(2)}) ball=(${b.x.toFixed(2)},${b.y.toFixed(2)},${b.z.toFixed(2)}) v=(${v.x.toFixed(1)},${v.y.toFixed(1)},${v.z.toFixed(1)}) holds=${body.holds.length} handL=${body.handPos(0).toArray().map(n=>n.toFixed(2))} fallen=${body.fallen}`); };
   run(1); rep("idle");
-  body.inputs.arms.f = 1; run(0.12); body.inputs.arms.f = 0; body.inputs.torso.b = true; run(1.2); rep("crouch arms 0.3");
-  body.inputs.arms.q = true; run(0.5); rep("grab L");
+  body.inputs.lhand.f = 1; body.inputs.rhand.f = 1; run(0.12); body.inputs.lhand.f = 0; body.inputs.rhand.f = 0; body.inputs.torso.b = true; run(1.2); rep("crouch arms 0.3");
+  body.inputs.lhand.q = true; run(0.5); rep("grab L");
   body.inputs.torso.b = false; run(1.0); rep("stand");
-  body.inputs.arms.f = 1; run(0.5); body.inputs.arms.f = 0; run(0.5); rep("arms up w/ ball");
-  body.inputs.arms.b = true; run(0.02); body.inputs.arms.b = false; rep("throw!");
+  body.inputs.lhand.f = 1; body.inputs.rhand.f = 1; run(0.5); body.inputs.lhand.f = 0; body.inputs.rhand.f = 0; run(0.5); rep("arms up w/ ball");
+  body.inputs.lhand.b = true; body.inputs.rhand.b = true; run(0.02); body.inputs.lhand.b = false; body.inputs.rhand.b = false; rep("throw!");
   run(0.5); rep("0.5s later");
   run(1.5); rep("2s later");
 }

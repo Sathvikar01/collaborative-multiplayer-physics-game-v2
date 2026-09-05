@@ -7,7 +7,17 @@ type World = RAPIER_T.World;
 type RigidBody = RAPIER_T.RigidBody;
 
 export type BodyInputs = Record<PhysRole, RoleInput>;
-export const makeInputs = (): BodyInputs => ({ head: emptyInput(), arms: emptyInput(), torso: emptyInput(), lleg: emptyInput(), rleg: emptyInput() });
+/** The squad mixer expands external roles into these six physical channels. */
+export const makeInputs = (): BodyInputs => ({
+  head: emptyInput(),
+  lhand: emptyInput(),
+  rhand: emptyInput(),
+  torso: emptyInput(),
+  lleg: emptyInput(),
+  rleg: emptyInput(),
+});
+
+type ReactorInputs = BodyInputs & { lhand: RoleInput; rhand: RoleInput; arms?: RoleInput };
 
 export const GROUP_ENV = 0b001;
 export const GROUP_BODY = 0b010;
@@ -61,10 +71,11 @@ export interface GrabTarget {
 }
 
 export interface BodyEvent {
-  type: "step" | "land" | "grab" | "release" | "throw" | "fall" | "getup" | "jump" | "kick" | "shout" | "climb";
+  type: "step" | "land" | "grab" | "release" | "throw" | "fall" | "getup" | "jump" | "kick" | "shout" | "climb" | "slip" | "drop";
   pos: [number, number, number];
   hand?: number;
   propId?: number;
+  reason?: string;
 }
 
 export interface Hold {
@@ -74,9 +85,14 @@ export interface Hold {
   isStatic: boolean;
   mass: number;
   id: number;
+  localAnchor?: THREE.Vector3;
   snapFrom?: THREE.Vector3;
   snapTo?: THREE.Vector3;
   snapT: number;
+  load?: number;
+  stress?: number;
+  slipT?: number;
+  slipping?: boolean;
 }
 
 interface LegState {
@@ -87,6 +103,14 @@ interface LegState {
   lastPressed: number;
   wasDown: boolean;
   pressTime: number;
+}
+
+export interface GripDiagnostic {
+  hand: 0 | 1;
+  propId: number;
+  load: number;
+  stress: number;
+  slipping: boolean;
 }
 
 const _qP = new THREE.Quaternion();
@@ -112,6 +136,7 @@ const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 
 export class RagdollBody {
   parts: RigidBody[] = [];
+  articulationJoints: RAPIER_T.ImpulseJoint[] = [];
   colliderHandles = new Set<number>();
   inputs: BodyInputs = makeInputs();
   prev: BodyInputs = makeInputs();
@@ -120,6 +145,9 @@ export class RagdollBody {
   pelvisYaw = 0;
   armRaise = 0.1;
   armYaw = 0;
+  /** Per-hand targets are intentionally public for renderers/replays. */
+  armRaiseSide: [number, number] = [0.1, 0.1];
+  armYawSide: [number, number] = [0, 0];
   throwT = 0;
   crouch = 0;
   brace = 0;
@@ -147,6 +175,35 @@ export class RagdollBody {
   hangT = 0;
   grabLock = 0;
   findGrab: ((handPos: THREE.Vector3, excludeIds: number[]) => GrabTarget | null) | null = null;
+  footColliderHandles: [Set<number>, Set<number>] = [new Set(), new Set()];
+  supportFeet: [boolean, boolean] = [false, false];
+  supportPoints: [THREE.Vector3 | null, THREE.Vector3 | null] = [null, null];
+  centerOfMass = new THREE.Vector3();
+  centerOfMassVelocity = new THREE.Vector3();
+  capturePoint = new THREE.Vector3();
+  stabilityMargin = -1;
+  gripLoads: [number, number] = [0, 0];
+  gripStress: [number, number] = [0, 0];
+  gripStates: ["clear" | "slipping", "clear" | "slipping"] = ["clear", "clear"];
+  gripBlocked: [boolean, boolean] = [false, false];
+  fallReason: string | null = null;
+  private unsupportedT = 0;
+  private unstableT = 0;
+  private previousCom = new THREE.Vector3();
+  private previousComReady = false;
+  private heldTargetVelocity = new Map<number, THREE.Vector3>();
+  private skipSupportSampleOnce = false;
+
+  /** Compatibility aliases consumed by the fixed-step reactor diagnostics. */
+  get centreOfMass() {
+    return this.centerOfMass;
+  }
+  get supportContacts() {
+    return this.supportFeet.filter(Boolean).length;
+  }
+  get gripLoad() {
+    return Math.max(this.gripLoads[0], this.gripLoads[1]);
+  }
 
   constructor(public R: R, public world: World, spawn: THREE.Vector3, yaw: number) {
     const q = new THREE.Quaternion().setFromAxisAngle(UP, yaw);
@@ -170,34 +227,67 @@ export class RagdollBody {
       cd.setActiveEvents(R.ActiveEvents.CONTACT_FORCE_EVENTS).setContactForceEventThreshold(450);
       const col = world.createCollider(cd, rb);
       this.colliderHandles.add(col.handle);
+      if (i === LSH) this.footColliderHandles[0].add(col.handle);
+      else if (i === RSH) this.footColliderHandles[1].add(col.handle);
       if (p.extra) {
         for (const ex of p.extra) {
           const ecd = ex.shape === "ball" ? R.ColliderDesc.ball(ex.size[0]) : R.ColliderDesc.cuboid(ex.size[0], ex.size[1], ex.size[2]);
           ecd.setTranslation(ex.offset[0], ex.offset[1], ex.offset[2]).setMass(0.3).setFriction(ex.shape === "ball" ? 0.4 : 0.9).setCollisionGroups(groups(GROUP_BODY, GROUP_ENV | GROUP_PROP));
           const ec = world.createCollider(ecd, rb);
           this.colliderHandles.add(ec.handle);
+          if (i === LSH) this.footColliderHandles[0].add(ec.handle);
+          else if (i === RSH) this.footColliderHandles[1].add(ec.handle);
         }
       }
       this.parts.push(rb);
       this.totalMass += p.mass + (p.extra?.length ?? 0) * 0.3;
     }
-    for (let i = 1; i < PARTS.length; i++) {
-      const p = PARTS[i];
-      const jd = R.JointData.spherical(
-        { x: p.anchorParent[0], y: p.anchorParent[1], z: p.anchorParent[2] },
-        { x: p.anchorSelf[0], y: p.anchorSelf[1], z: p.anchorSelf[2] }
-      );
-      world.createImpulseJoint(jd, this.parts[p.parent], this.parts[i], true);
-    }
+    this.createArticulationJoints();
     this.heading = yaw;
     this.pelvisYaw = yaw;
     this.inputs.head.lx = yaw;
+    this.centerOfMass.copy(spawn).add(new THREE.Vector3(0, PELVIS_H + 0.2, 0));
+    this.previousCom.copy(this.centerOfMass);
+    this.previousComReady = true;
+  }
+
+  private createArticulationJoints() {
+    const R = this.R;
+    for (let i = 1; i < PARTS.length; i++) {
+      const p = PARTS[i];
+      const parentAnchor = { x: p.anchorParent[0], y: p.anchorParent[1], z: p.anchorParent[2] };
+      const childAnchor = { x: p.anchorSelf[0], y: p.anchorSelf[1], z: p.anchorSelf[2] };
+      if (i === LFA || i === RFA || i === LSH || i === RSH) {
+        // Elbows and knees are hinge joints, not unrestricted ball sockets.
+        // The active controller still supplies muscle torque, while Rapier
+        // enforces the anatomical range under impacts and carried loads.
+        const joint = this.world.createImpulseJoint(
+          R.JointData.revolute(parentAnchor, childAnchor, { x: 1, y: 0, z: 0 }),
+          this.parts[p.parent],
+          this.parts[i],
+          true
+        ) as RAPIER_T.RevoluteImpulseJoint;
+        joint.setLimits(i === LFA || i === RFA ? -0.08 : -2.35, i === LFA || i === RFA ? 1.9 : 0.08);
+        this.articulationJoints.push(joint);
+      } else {
+        const jd = R.JointData.spherical(parentAnchor, childAnchor);
+        this.articulationJoints.push(this.world.createImpulseJoint(jd, this.parts[p.parent], this.parts[i], true));
+      }
+    }
+  }
+
+  /** Reset solver warm-start state after a checkpoint restore. */
+  rebuildArticulationJoints() {
+    for (const joint of this.articulationJoints) if (joint.isValid()) this.world.removeImpulseJoint(joint, true);
+    this.articulationJoints = [];
+    this.createArticulationJoints();
   }
 
   dispose() {
     this.releaseAll(false);
     for (const p of this.parts) this.world.removeRigidBody(p);
     this.parts = [];
+    this.articulationJoints = [];
   }
 
   pos(i: number, out = new THREE.Vector3()) {
@@ -233,22 +323,34 @@ export class RagdollBody {
       rb.setLinvel({ x: 0, y: 0, z: 0 }, true);
       rb.setAngvel({ x: 0, y: 0, z: 0 }, true);
     }
+    this.rebuildArticulationJoints();
     this.heading = yaw;
     this.pelvisYaw = yaw;
     this.headPitch = 0;
     this.inputs.head.lx = yaw;
     this.inputs.head.ly = 0;
     this.fallen = false;
+    this.fallReason = null;
     this.balance = 1;
     this.recoverT = 0;
     this.fallT = 0;
     this.armRaise = 0.1;
+    this.armRaiseSide = [0.1, 0.1];
+    this.armYawSide = [0, 0];
     this.crouch = 0;
     for (const l of this.legs) {
       l.lifted = false;
       l.t = 9;
       l.kickT = 0;
     }
+    this.supportFeet = [false, false];
+    this.supportPoints = [null, null];
+    this.gripBlocked = [false, false];
+    this.unsupportedT = 0;
+    this.unstableT = 0;
+    this.previousComReady = false;
+    this.heldTargetVelocity.clear();
+    this.skipSupportSampleOnce = false;
   }
 
   private emit(type: BodyEvent["type"], p: THREE.Vector3, extra?: Partial<BodyEvent>) {
@@ -283,17 +385,180 @@ export class RagdollBody {
     p.addTorque({ x: -_torque.x, y: -_torque.y, z: -_torque.z }, true);
   }
 
+  /** Read last-step solver contacts. Support is contact-derived, never key-derived. */
+  private sampleFootSupport() {
+    this.supportFeet = [false, false];
+    this.supportPoints = [null, null];
+    const heldHandles = new Set(this.holds.map((hold) => hold.target.handle));
+    for (let leg = 0; leg < 2; leg++) {
+      let bestImpulse = -1;
+      for (const handle of this.footColliderHandles[leg]) {
+        let collider: RAPIER_T.Collider;
+        try {
+          collider = this.world.getCollider(handle);
+        } catch {
+          continue;
+        }
+        this.world.contactPairsWith(collider, (other) => {
+          if (this.colliderHandles.has(other.handle)) return;
+          const supportBody = other.parent();
+          if (supportBody && heldHandles.has(supportBody.handle)) return;
+          if (supportBody?.isDynamic()) {
+            const velocity = supportBody.linvel();
+            const angular = supportBody.angvel();
+            if (Math.hypot(velocity.x, velocity.y, velocity.z) > 0.6 || Math.hypot(angular.x, angular.y, angular.z) > 1.5) return;
+          }
+          this.world.contactPair(collider, other, (manifold) => {
+            const n = manifold.normal();
+            let manifoldImpulse = 0;
+            for (let i = 0; i < manifold.numContacts(); i++) manifoldImpulse += Math.abs(manifold.contactImpulse(i));
+            // A foot must have a mostly vertical solver contact below it. This
+            // rejects brushing a wall and makes a lifted leg genuinely unsupported.
+            const foot = this.footPos(leg as 0 | 1, _v2);
+            for (let i = 0; i < manifold.numSolverContacts(); i++) {
+              const point = manifold.solverContactPoint(i);
+              if (!point || point.y > foot.y + 0.12 || Math.abs(n.y) < 0.55) continue;
+              if (manifoldImpulse >= bestImpulse) {
+                bestImpulse = manifoldImpulse;
+                this.supportFeet[leg as 0 | 1] = true;
+                this.supportPoints[leg as 0 | 1] = new THREE.Vector3(point.x, point.y, point.z);
+              }
+            }
+          });
+        });
+      }
+    }
+  }
+
+  /** Seed one fixed step after an atomic reactor restore. */
+  prepareAfterRestore() {
+    this.supportPoints = [
+      this.supportFeet[0] ? this.footPos(0, new THREE.Vector3()) : null,
+      this.supportFeet[1] ? this.footPos(1, new THREE.Vector3()) : null,
+    ];
+    this.skipSupportSampleOnce = true;
+  }
+
+  private updateMassDiagnostics(dt: number) {
+    const sum = new THREE.Vector3();
+    let mass = 0;
+    for (const rb of this.parts) {
+      const m = rb.mass();
+      const c = rb.worldCom();
+      sum.addScaledVector(new THREE.Vector3(c.x, c.y, c.z), m);
+      mass += m;
+    }
+    const seen = new Set<number>();
+    for (const h of this.holds) {
+      if (h.isStatic || seen.has(h.target.handle)) continue;
+      seen.add(h.target.handle);
+      const m = Math.max(0, h.target.mass());
+      const c = h.target.worldCom();
+      sum.addScaledVector(new THREE.Vector3(c.x, c.y, c.z), m);
+      mass += m;
+    }
+    if (mass > 0) this.centerOfMass.copy(sum).multiplyScalar(1 / mass);
+    if (this.previousComReady && dt > 0) this.centerOfMassVelocity.copy(this.centerOfMass).sub(this.previousCom).multiplyScalar(1 / dt);
+    else this.centerOfMassVelocity.set(0, 0, 0);
+    this.previousCom.copy(this.centerOfMass);
+    this.previousComReady = true;
+
+    const support = this.supportPoints.filter((p): p is THREE.Vector3 => p !== null);
+    const supportY = support.length ? support.reduce((v, p) => v + p.y, 0) / support.length : this.centerOfMass.y - 0.8;
+    const h = Math.max(0.25, this.centerOfMass.y - supportY);
+    const omega = Math.sqrt(9.81 / h);
+    this.capturePoint.copy(this.centerOfMass).addScaledVector(this.centerOfMassVelocity, 1 / omega);
+    if (support.length === 0) {
+      this.stabilityMargin = -1;
+    } else if (support.length === 1) {
+      this.stabilityMargin = 0.16 - Math.hypot(this.capturePoint.x - support[0].x, this.capturePoint.z - support[0].z);
+    } else {
+      const a = support[0], b = support[1];
+      const dx = b.x - a.x, dz = b.z - a.z;
+      const len2 = dx * dx + dz * dz;
+      const u = len2 > 1e-6 ? clamp(((this.capturePoint.x - a.x) * dx + (this.capturePoint.z - a.z) * dz) / len2, 0, 1) : 0;
+      const px = a.x + dx * u, pz = a.z + dz * u;
+      // Two planted feet form a capsule-shaped approximation of the true
+      // support polygon. Include the toe/heel depth, not merely the line
+      // between ankle contact points.
+      this.stabilityMargin = 0.28 - Math.hypot(this.capturePoint.x - px, this.capturePoint.z - pz);
+    }
+  }
+
+  private updateGripDiagnostics(dt: number) {
+    this.gripLoads = [0, 0];
+    this.gripStress = [0, 0];
+    this.gripStates = ["clear", "clear"];
+    const groups = new Map<number, Hold[]>();
+    for (const h of this.holds) {
+      const list = groups.get(h.target.handle) ?? [];
+      list.push(h);
+      groups.set(h.target.handle, list);
+    }
+    for (const handle of this.heldTargetVelocity.keys()) if (!groups.has(handle)) this.heldTargetVelocity.delete(handle);
+    for (const list of groups.values()) {
+      const target = list[0].target;
+      const targetMass = Math.max(0, list[0].mass || target.mass());
+      const targetVel = target.linvel();
+      const velocity = new THREE.Vector3(targetVel.x, targetVel.y, targetVel.z);
+      const previousVelocity = this.heldTargetVelocity.get(target.handle);
+      const acceleration = previousVelocity && dt > 0 ? velocity.clone().sub(previousVelocity).multiplyScalar(1 / dt).length() : 0;
+      this.heldTargetVelocity.set(target.handle, velocity);
+      const mismatch = list.length > 1
+        ? Math.hypot(this.armRaiseSide[0] - this.armRaiseSide[1], this.armYawSide[0] - this.armYawSide[1])
+        : 0;
+      // Acceleration, not velocity, creates additional grip demand. Filter the
+      // solver's single-tick contact spikes so resting jitter cannot drop an
+      // otherwise well-coordinated load.
+      const totalDemand = targetMass * 9.81 + targetMass * Math.min(5, acceleration * 0.15);
+      for (const h of list) {
+        const hand = this.handPos(h.hand, _v);
+        const targetPos = h.target.translation();
+        const targetRot = h.target.rotation();
+        const anchorLocal = h.localAnchor ?? new THREE.Vector3();
+        const anchor = new THREE.Vector3(anchorLocal.x, anchorLocal.y, anchorLocal.z)
+          .applyQuaternion(_qT.set(targetRot.x, targetRot.y, targetRot.z, targetRot.w))
+          .add(new THREE.Vector3(targetPos.x, targetPos.y, targetPos.z));
+        const error = Math.hypot(hand.x - anchor.x, hand.y - anchor.y, hand.z - anchor.z);
+        const load = totalDemand / list.length + error * 140 + mismatch * 22;
+        // A single hand can manage the light sports props, but the 4-6 kg
+        // cargo requires two players to share its weight.  Static ledges get
+        // a higher limit because both arms and the fingers can brace on them.
+        const capacity = (h.isStatic ? 400 : 36) * (list.length > 1 ? 1.75 : 1) * (targetMass > 10 ? 0.72 : 1);
+        const stress = load / Math.max(1, capacity);
+        h.load = load;
+        h.stress = stress;
+        h.slipping = stress > 0.82;
+        h.slipT = Math.max(0, (h.slipT ?? 0) + (stress > 0.82 ? dt * (stress - 0.7) : -dt * 1.5));
+        this.gripLoads[h.hand] = load;
+        this.gripStress[h.hand] = stress;
+        this.gripStates[h.hand] = h.slipping ? "slipping" : "clear";
+        if (h.slipping && h.slipT > 0.16) {
+          const p = this.handPos(h.hand, new THREE.Vector3());
+          this.emit("slip", p, { hand: h.hand, propId: h.id, reason: "grip-overload" });
+          this.gripBlocked[h.hand] = true;
+          this.release(h, false);
+          this.emit("drop", p, { hand: h.hand, propId: h.id, reason: "grip-overload" });
+        }
+      }
+    }
+  }
+
   /** Called once per physics step (dt = step size). */
   update(dt: number) {
     const R = this.R;
     this.time += dt;
     this.events.length = 0;
-    const inp = this.frozen ? makeInputs() : this.inputs;
+    const inp = (this.frozen ? makeInputs() : this.inputs) as ReactorInputs;
     if (this.frozen) inp.head.lx = this.heading;
     for (const rb of this.parts) {
       rb.resetForces(true);
       rb.resetTorques(true);
     }
+    // Manifolds describe the previous solver step, which is exactly the
+    // stable support information available while applying this step's forces.
+    if (this.skipSupportSampleOnce) this.skipSupportSampleOnce = false;
+    else this.sampleFootSupport();
 
     // ---- Head / heading ----
     this.heading = inp.head.lx;
@@ -353,7 +618,6 @@ export class RagdollBody {
 
     // ---- Legs: strides, kicks, jumps ----
     const legInputs = [inp.lleg, inp.rleg];
-    let planted = 0;
     let bothKick = false;
     for (let i = 0; i < 2; i++) {
       const L = this.legs[i];
@@ -384,45 +648,49 @@ export class RagdollBody {
         else this.emit("kick", this.footPos(i as 0 | 1, _v2));
       }
       L.kickT = Math.max(0, L.kickT - dt);
-      if (!L.lifted && L.kickT <= 0) planted++;
     }
     const hanging = this.holds.some((h) => h.isStatic);
-    const climbing = hanging && inp.arms.f < -0.3 && !mantling;
-    const support = this.fallen || climbing ? 0 : mantling ? 1 : planted === 2 ? 1 : planted === 1 ? 0.92 : 0;
+    const climbing = hanging && (inp.lhand.f + inp.rhand.f) * 0.5 < -0.3 && !mantling;
+    const supportedFeet = this.supportFeet.filter(Boolean).length;
+    const support = this.fallen || climbing ? 0 : mantling ? 1 : supportedFeet === 2 ? 1 : supportedFeet === 1 ? 0.72 : 0;
     const targetH = mantling ? 0.6 : PELVIS_H + 0.03 - this.crouch * 0.38;
     const wasGrounded = this.grounded;
-    this.grounded = this.groundDist < targetH + 0.35;
+    this.grounded = supportedFeet > 0 || mantling || (this.fallen && this.groundDist < targetH + 0.35);
     if (this.grounded && !wasGrounded && this.airT > 0.25) this.emit("land", pp);
     this.airT = this.grounded ? 0 : this.airT + dt;
     this.jumpCooldown -= dt;
+    this.updateMassDiagnostics(dt);
 
     // ---- Falling / recovery ----
-    if (!this.fallen && tilt > 1.08 && !hanging) {
+    const intentionalAirborne = this.jumpCooldown > 0.15;
+    if (supportedFeet === 0 && !hanging && !bothKick && !intentionalAirborne && !mantling && !this.fallen) this.unsupportedT += dt;
+    else if (supportedFeet > 0 || hanging || bothKick || intentionalAirborne) this.unsupportedT = 0;
+    if (supportedFeet > 0 && this.stabilityMargin < -0.12 && !hanging && !this.fallen) {
+      const braceScale = inp.torso.a ? 0.25 : 1;
+      this.unstableT += dt * braceScale * clamp((-this.stabilityMargin - 0.08) * 4, 0.35, 2);
+    } else {
+      this.unstableT = Math.max(0, this.unstableT - dt * 1.5);
+    }
+    const unsupportedLimit = inp.torso.a ? 0.4 : 0.22;
+    if (!this.fallen && !hanging && ((!intentionalAirborne && tilt > 1.08) || this.unsupportedT > unsupportedLimit || this.unstableT > 0.42)) {
       this.fallen = true;
+      this.fallReason = supportedFeet === 0 ? "no-foot-support" : this.unstableT > 0.42 ? "capture-point-outside-support" : "excessive-tilt";
       this.fallT = 0;
       this.recoverT = 0;
       this.releaseAll(true);
-      this.emit("fall", pp);
+      this.emit("fall", pp, { reason: this.fallReason });
     }
     if (this.fallen) {
       this.fallT += dt;
-      const wantsUp = inp.torso.a || this.fallT > 2.6;
+      const wantsUp = inp.torso.a;
       if (wantsUp) this.recoverT += dt;
       else this.recoverT = Math.max(0, this.recoverT - dt * 0.5);
       this.balance = clamp(this.recoverT / 0.7, 0, 1) * 0.75 + (this.fallT < 0.15 ? 0.4 : 0);
       if (this.recoverT > 0.5 && tilt < 0.55) {
         this.fallen = false;
-        this.balance = 1;
-        this.emit("getup", pp);
-      } else if (this.recoverT > 2.2) {
-        // physics assist: hard reset orientation
-        const q = new THREE.Quaternion().setFromAxisAngle(UP, this.heading);
-        const rb = this.parts[PELVIS];
-        rb.setRotation({ x: q.x, y: q.y, z: q.z, w: q.w }, true);
-        rb.setTranslation({ x: pp.x, y: pp.y + 0.5, z: pp.z }, true);
-        rb.setAngvel({ x: 0, y: 0, z: 0 }, true);
-        rb.setLinvel({ x: 0, y: 1.5, z: 0 }, true);
-        this.fallen = false;
+        this.fallReason = null;
+        this.unsupportedT = 0;
+        this.unstableT = 0;
         this.balance = 1;
         this.emit("getup", pp);
       }
@@ -430,7 +698,7 @@ export class RagdollBody {
       this.balance = lerp(this.balance, 1, 1 - Math.exp(-dt * 6));
     }
     const bal = this.balance;
-    const limbGain = this.fallen ? 0.12 : 1;
+    const limbGain = this.fallen ? lerp(0.12, 0.88, clamp(this.recoverT / 1.2, 0, 1)) : 1;
 
     // ---- Hover / support ----
     const pelvis = this.parts[PELVIS];
@@ -439,9 +707,12 @@ export class RagdollBody {
     if (support > 0 && this.grounded && !this.fallen) {
       const err = targetH - this.groundDist;
       const vy = lin.y;
-      let f = m * (55 * err - 9 * vy) * support * bal + m * g * support * bal;
-      if (err < -0.25) f = Math.max(Math.min(f, 0), -m * g * 0.6); // don't yank down when high
-      f -= m * g * 0.7 * this.crouch;
+      // Feet and contact impulses carry most of the weight. This is only a
+      // bounded compliance term, so balance cannot be faked by a hover spring.
+      let f = m * (46 * err - 8 * vy) * support * bal + m * g * 0.62 * support * bal;
+      if (err < -0.25) f = Math.max(Math.min(f, 0), -m * g * 0.35);
+      f -= m * g * 0.28 * this.crouch;
+      f = clamp(f, -m * g * 0.45, m * g * 0.9);
       if (bothKick) f = 0;
       pelvis.addForce({ x: 0, y: f, z: 0 }, true);
     } else if (this.fallen && this.recoverT > 0.05) {
@@ -472,18 +743,40 @@ export class RagdollBody {
           const k = (same ? strength : 1) * (1 - L.t / 0.42);
           const speedMax = 3.4 - this.crouch * 1.2;
           const desired = _v2.copy(fwd).multiplyScalar(L.dir.y * speedMax).addScaledVector(right, L.dir.x * speedMax * 0.8);
-          const fx = m * (desired.x - lin.x) * 9 * k;
-          const fz = m * (desired.z - lin.z) * 9 * k;
-          pelvis.addForce({ x: fx, y: 0, z: fz }, true);
+          const requested = new THREE.Vector3(m * (desired.x - lin.x) * 6.5 * k, 0, m * (desired.z - lin.z) * 6.5 * k);
+          const maxTraction = m * g * 1.15;
+          if (requested.lengthSq() > maxTraction * maxTraction) requested.setLength(maxTraction);
+          const stanceIndex = 1 - i;
+          if (this.supportFeet[stanceIndex]) {
+            const footBody = this.parts[stanceIndex === 0 ? LSH : RSH];
+            const stance = this.supportPoints[stanceIndex] ?? this.footPos(stanceIndex as 0 | 1, _v);
+            footBody.addForceAtPoint({ x: requested.x, y: 0, z: requested.z }, { x: stance.x, y: stance.y, z: stance.z }, true);
+          }
         }
       }
       // leaning forward drifts you
-      if (Math.abs(leanF) > 0.2 && planted > 0) {
-        pelvis.addForce({ x: fwd.x * m * leanF * 1.4, y: 0, z: fwd.z * m * leanF * 1.4 }, true);
+      if (Math.abs(leanF) > 0.2 && supportedFeet > 0) {
+        for (let i = 0; i < 2; i++) {
+          if (!this.supportFeet[i]) continue;
+          const stance = this.supportPoints[i] ?? this.footPos(i as 0 | 1, _v);
+          this.parts[i === 0 ? LSH : RSH].addForceAtPoint(
+            { x: fwd.x * m * leanF * 1.1 / supportedFeet, y: 0, z: fwd.z * m * leanF * 1.1 / supportedFeet },
+            { x: stance.x, y: stance.y, z: stance.z },
+            true
+          );
+        }
       }
-      if (!pushing && planted > 0) {
-        const brake = planted === 2 ? 5.5 : 2.2;
-        pelvis.addForce({ x: -lin.x * m * brake, y: 0, z: -lin.z * m * brake }, true);
+      if (!pushing && supportedFeet > 0) {
+        const brake = supportedFeet === 2 ? 5.5 : 2.2;
+        for (let i = 0; i < 2; i++) {
+          if (!this.supportFeet[i]) continue;
+          const stance = this.supportPoints[i] ?? this.footPos(i as 0 | 1, _v);
+          this.parts[i === 0 ? LSH : RSH].addForceAtPoint(
+            { x: -lin.x * m * brake / supportedFeet, y: 0, z: -lin.z * m * brake / supportedFeet },
+            { x: stance.x, y: stance.y, z: stance.z },
+            true
+          );
+        }
       }
     }
 
@@ -504,7 +797,13 @@ export class RagdollBody {
     // ---- Upright controller on pelvis ----
     {
       const targetPitch = -leanF * 0.28;
-      const targetRoll = -leanS * 0.3 + (planted === 1 ? (this.legs[0].lifted ? -0.05 : 0.05) : 0);
+      const captureDx = this.capturePoint.x - this.centerOfMass.x;
+      const captureDz = this.capturePoint.z - this.centerOfMass.z;
+      const rightX = Math.cos(this.heading);
+      const rightZ = -Math.sin(this.heading);
+      const lateralCaptureError = captureDx * rightX + captureDz * rightZ;
+      const targetRoll = clamp(-leanS * 0.3 - lateralCaptureError * 0.18, -0.42, 0.42)
+        + (supportedFeet === 1 ? (this.supportFeet[0] ? -0.06 : 0.06) : 0);
       _e.set(targetPitch, this.heading, targetRoll, "YXZ");
       _qT.setFromEuler(_e);
       _qInv.copy(pelvisQ).invert();
@@ -519,12 +818,13 @@ export class RagdollBody {
       const tiltEx = _err.x;
       const tiltEz = _err.z;
       const av = pelvis.angvel();
-      const kU = (this.fallen ? 260 : 440) * bal * (1 + this.brace * 0.8) * (this.grounded ? 1 : 0.35);
-      const dU = 60 * Math.sqrt(bal) * (1 + this.brace * 0.5);
+      const supportAuthority = this.fallen && this.recoverT > 0.05 ? 0.8 : supportedFeet > 0 ? 1 : 0.18;
+      const kU = (this.fallen ? 260 : 235) * bal * (1 + this.brace * 0.7) * supportAuthority;
+      const dU = 42 * Math.sqrt(bal) * (1 + this.brace * 0.45);
       const kY = 160 * bal;
       const dY = 30;
       _torque.set(kU * tiltEx - dU * av.x, kY * yawE - dY * av.y, kU * tiltEz - dU * av.z);
-      const maxT = (this.fallen ? 220 : 270) * (1 + this.brace * 0.6);
+      const maxT = (this.fallen ? 190 : 175) * (1 + this.brace * 0.55);
       if (_torque.lengthSq() > maxT * maxT) _torque.setLength(maxT);
       pelvis.addTorque({ x: _torque.x, y: _torque.y, z: _torque.z }, true);
     }
@@ -539,21 +839,31 @@ export class RagdollBody {
     this.drive(HEAD, CHEST, _qL.setFromEuler(_e), limbGain);
 
     // arms
-    this.armRaise = clamp(this.armRaise + inp.arms.f * dt * 1.6, 0, 1);
-    this.armYaw = lerp(this.armYaw, -inp.arms.s * 0.9, 1 - Math.exp(-dt * 6));
-    if (inp.arms.b && !this.prev.arms.b && this.holds.length > 0) this.throw();
+    const leftHandInput = inp.lhand ?? inp.arms ?? emptyInput();
+    const rightHandInput = inp.rhand ?? inp.arms ?? emptyInput();
+    this.armRaiseSide[0] = clamp(this.armRaiseSide[0] + leftHandInput.f * dt * 1.6, 0, 1);
+    this.armRaiseSide[1] = clamp(this.armRaiseSide[1] + rightHandInput.f * dt * 1.6, 0, 1);
+    this.armYawSide[0] = lerp(this.armYawSide[0], -leftHandInput.s * 0.9, 1 - Math.exp(-dt * 6));
+    this.armYawSide[1] = lerp(this.armYawSide[1], -rightHandInput.s * 0.9, 1 - Math.exp(-dt * 6));
+    this.armRaise = (this.armRaiseSide[0] + this.armRaiseSide[1]) * 0.5;
+    this.armYaw = (this.armYawSide[0] + this.armYawSide[1]) * 0.5;
+    const leftPrev = (this.prev as ReactorInputs).lhand ?? (this.prev as ReactorInputs).arms ?? emptyInput();
+    const rightPrev = (this.prev as ReactorInputs).rhand ?? (this.prev as ReactorInputs).arms ?? emptyInput();
+    const throwLeft = leftHandInput.b && !leftPrev.b;
+    const throwRight = rightHandInput.b && !rightPrev.b;
+    const bilateralTarget = this.holds.some((h) => this.holds.some((o) => o !== h && o.target.handle === h.target.handle));
+    if (this.holds.length > 0 && (bilateralTarget ? throwLeft && throwRight : throwLeft || throwRight)) this.throw();
     this.throwT = Math.max(0, this.throwT - dt);
     const throwSwing = this.throwT > 0 ? Math.sin((this.throwT / 0.35) * Math.PI) : 0;
-    const baseArm = 0.12 + this.armRaise * 2.5 + throwSwing * 1.2 + (this.fallen ? 0.5 : 0);
     const holdingAny = this.holds.length > 0;
     for (let side = 0; side < 2; side++) {
       const sgn = side === 0 ? -1 : 1;
       const holding = this.holds.some((h) => h.hand === side);
-      const raise = holding ? Math.max(baseArm, 0.9) : baseArm;
+      const raise = holding ? Math.max(0.12 + this.armRaiseSide[side] * 2.5, 0.9) : 0.12 + this.armRaiseSide[side] * 2.5 + throwSwing * 1.2 + (this.fallen ? 0.5 : 0);
       const spread = holding ? 0.05 : 0.18 + (this.armRaise > 0.2 ? 0 : 0);
-      _e.set(raise, this.armYaw, sgn * spread, "YXZ");
+      _e.set(clamp(raise, 0.05, 2.75), this.armYawSide[side], sgn * spread, "YXZ");
       this.drive(side === 0 ? LUA : RUA, CHEST, _qL.setFromEuler(_e), limbGain * (holding ? 1.6 : 1) * (this.throwT > 0 ? 2 : 1));
-      const elbow = holdingAny ? 0.5 : 0.25 + this.armRaise * 0.5 + throwSwing * 0.8;
+      const elbow = clamp(holdingAny ? 0.5 : 0.25 + this.armRaiseSide[side] * 0.5 + throwSwing * 0.8, 0.12, 1.65);
       _e.set(elbow, 0, sgn * 0.15, "YXZ");
       this.drive(side === 0 ? LFA : RFA, side === 0 ? LUA : RUA, _qL.setFromEuler(_e), limbGain);
     }
@@ -586,6 +896,10 @@ export class RagdollBody {
         pitch = 0.35;
         knee = -0.9;
       }
+      // Rapier spherical joints remain useful for the active ragdoll, but
+      // these manual anatomical limits prevent hyperextension at high gain.
+      pitch = clamp(pitch, -1.35, 1.8);
+      knee = clamp(knee, -2.35, 0.08);
       _e.set(pitch, 0, roll, "YXZ");
       this.drive(i === 0 ? LTH : RTH, PELVIS, _qL.setFromEuler(_e), limbGain * gain);
       _e.set(knee, 0, 0, "YXZ");
@@ -593,12 +907,33 @@ export class RagdollBody {
     }
 
     // ---- Grabbing ----
-    const wantL = inp.arms.a || inp.arms.q;
-    const wantR = inp.arms.a || inp.arms.e;
+    const wantL = leftHandInput.a || leftHandInput.q;
+    const wantR = rightHandInput.a || rightHandInput.e;
+    const coordinatedGrip = leftHandInput.a && rightHandInput.a && !leftHandInput.q && !rightHandInput.e;
     this.grabLock = Math.max(0, this.grabLock - dt);
     if (!this.fallen) {
-      this.updateHand(0, wantL);
-      this.updateHand(1, wantR);
+      if (coordinatedGrip && this.findGrab && this.grabLock <= 0) {
+        const heldL = this.holds.find((h) => h.hand === 0);
+        const heldR = this.holds.find((h) => h.hand === 1);
+        if (heldL && heldR) {
+          // Existing bilateral grips stay independent, but Space may not bind
+          // the two hands to two unrelated objects.
+          if (heldL.target.handle !== heldR.target.handle) this.release(heldR, true);
+        } else {
+          const leftTarget = heldL ? null : this.findGrab(this.handPos(0, new THREE.Vector3()), []);
+          const rightTarget = heldR ? null : this.findGrab(this.handPos(1, new THREE.Vector3()), []);
+          const targetHandle = heldL?.target.handle ?? heldR?.target.handle ?? leftTarget?.body.handle ?? rightTarget?.body.handle;
+          const leftCompatible = heldL ? heldL.target.handle === targetHandle : leftTarget?.body.handle === targetHandle;
+          const rightCompatible = heldR ? heldR.target.handle === targetHandle : rightTarget?.body.handle === targetHandle;
+          if (targetHandle !== undefined && leftCompatible && rightCompatible) {
+            if (!heldL && leftTarget) this.updateHand(0, true, leftTarget);
+            if (!heldR && rightTarget) this.updateHand(1, true, rightTarget);
+          }
+        }
+      } else {
+        this.updateHand(0, wantL);
+        this.updateHand(1, wantR);
+      }
     }
     // slide ledge-snap anchors smoothly
     for (const h of this.holds) {
@@ -608,45 +943,116 @@ export class RagdollBody {
         h.joint.setAnchor2({ x: lerp(h.snapFrom.x, h.snapTo.x, k), y: lerp(h.snapFrom.y, h.snapTo.y, k), z: lerp(h.snapFrom.z, h.snapTo.z, k) });
       }
     }
-    // carry assist: partially cancel weight of held dynamic props
-    for (const h of this.holds) {
-      if (!h.isStatic) {
-        h.target.resetForces(true);
-        h.target.addForce({ x: 0, y: h.mass * g * 0.72, z: 0 }, true);
-      }
-    }
+    // Held props retain their full mass. The only support they receive is
+    // through the two independent hand constraints and the player's body.
+    this.updateGripDiagnostics(dt);
 
     // copy prev
     for (const r of PHYS_ROLES) Object.assign(this.prev[r], inp[r]);
   }
 
-  private updateHand(hand: 0 | 1, want: boolean) {
+  private updateHand(hand: 0 | 1, want: boolean, candidate?: GrabTarget) {
     const held = this.holds.find((h) => h.hand === hand);
-    if (want && !held && this.findGrab && this.grabLock <= 0) {
+    if (!want) {
+      this.gripBlocked[hand] = false;
+      if (held) this.release(held, true);
+      return;
+    }
+    if (this.gripBlocked[hand]) return;
+    if (!held && this.findGrab && this.grabLock <= 0) {
       const hp = this.handPos(hand, new THREE.Vector3());
-      const t = this.findGrab(hp, []);
+      const t = candidate ?? this.findGrab(hp, []);
       if (t) {
         const fa = this.parts[hand === 0 ? LFA : RFA];
         const a2 = t.snapFrom ?? t.localAnchor;
         const jd = this.R.JointData.spherical({ x: HAND_LOCAL.x, y: HAND_LOCAL.y, z: HAND_LOCAL.z }, { x: a2.x, y: a2.y, z: a2.z });
         const joint = this.world.createImpulseJoint(jd, fa, t.body, true);
-        this.holds.push({ hand, joint, target: t.body, isStatic: t.isStatic, mass: t.mass, id: t.id, snapFrom: t.snapFrom, snapTo: t.snapFrom ? t.localAnchor : undefined, snapT: 0 });
+        this.holds.push({ hand, joint, target: t.body, isStatic: t.isStatic, mass: t.mass, id: t.id, localAnchor: t.localAnchor.clone(), snapFrom: t.snapFrom, snapTo: t.snapFrom ? t.localAnchor : undefined, snapT: 0 });
         this.emit("grab", hp, { hand, propId: t.id });
       }
-    } else if (!want && held) {
-      this.release(held, true);
     }
+  }
+
+  /** Recreate a serialized grip when the reactor restores a checkpoint. */
+  restoreGrip(descriptor: {
+    hand: 0 | 1;
+    id: number;
+    isStatic: boolean;
+    mass: number;
+    targetHandle?: number;
+    localAnchor: readonly [number, number, number];
+    snapFrom?: readonly [number, number, number];
+    snapTo?: readonly [number, number, number];
+    snapT?: number;
+    load?: number;
+    stress?: number;
+    slipT?: number;
+    slipping?: boolean;
+    targetState?: {
+      translation: readonly [number, number, number];
+      rotation: readonly [number, number, number, number];
+      linearVelocity: readonly [number, number, number];
+      angularVelocity: readonly [number, number, number];
+    };
+  }) {
+    if (this.holds.some((h) => h.hand === descriptor.hand) || descriptor.targetHandle == null) return false;
+    let target: RigidBody;
+    try {
+      target = this.world.getRigidBody(descriptor.targetHandle);
+    } catch {
+      return false;
+    }
+    if (descriptor.targetState && !descriptor.isStatic) {
+      const state = descriptor.targetState;
+      target.setTranslation({ x: state.translation[0], y: state.translation[1], z: state.translation[2] }, true);
+      target.setRotation({ x: state.rotation[0], y: state.rotation[1], z: state.rotation[2], w: state.rotation[3] }, true);
+      target.setLinvel({ x: state.linearVelocity[0], y: state.linearVelocity[1], z: state.linearVelocity[2] }, true);
+      target.setAngvel({ x: state.angularVelocity[0], y: state.angularVelocity[1], z: state.angularVelocity[2] }, true);
+      target.resetForces(true);
+      target.resetTorques(true);
+    }
+    const a2 = descriptor.localAnchor;
+    const fa = this.parts[descriptor.hand === 0 ? LFA : RFA];
+    const joint = this.world.createImpulseJoint(
+      this.R.JointData.spherical({ x: HAND_LOCAL.x, y: HAND_LOCAL.y, z: HAND_LOCAL.z }, { x: a2[0], y: a2[1], z: a2[2] }),
+      fa,
+      target,
+      true
+    );
+    this.holds.push({
+      hand: descriptor.hand,
+      joint,
+      target,
+      isStatic: descriptor.isStatic,
+      mass: descriptor.mass,
+      id: descriptor.id,
+      localAnchor: new THREE.Vector3(a2[0], a2[1], a2[2]),
+      snapFrom: descriptor.snapFrom ? new THREE.Vector3(...descriptor.snapFrom) : undefined,
+      snapTo: descriptor.snapTo ? new THREE.Vector3(...descriptor.snapTo) : undefined,
+      snapT: descriptor.snapT ?? 1,
+      load: descriptor.load,
+      stress: descriptor.stress,
+      slipT: descriptor.slipT,
+      slipping: descriptor.slipping,
+    });
+    const velocity = descriptor.targetState?.linearVelocity ?? (() => {
+      const value = target.linvel();
+      return [value.x, value.y, value.z] as const;
+    })();
+    this.heldTargetVelocity.set(target.handle, new THREE.Vector3(velocity[0], velocity[1], velocity[2]));
+    return true;
   }
 
   private release(h: Hold, emit: boolean) {
     this.world.removeImpulseJoint(h.joint, true);
-    if (!h.isStatic) h.target.resetForces(true);
     this.holds = this.holds.filter((x) => x !== h);
+    if (!this.holds.some((other) => other.target.handle === h.target.handle)) this.heldTargetVelocity.delete(h.target.handle);
     if (emit) this.emit("release", this.handPos(h.hand, new THREE.Vector3()), { hand: h.hand, propId: h.id });
   }
 
   releaseAll(emit: boolean) {
     for (const h of [...this.holds]) this.release(h, emit);
+    this.heldTargetVelocity.clear();
   }
 
   isHolding(id: number) {
@@ -696,7 +1102,14 @@ export class RagdollBody {
 
 
 /** Static-geometry grab with ledge snapping: prefers a walkable top surface near the hand. */
-export function findStaticGrab(R: R, world: World, hp: THREE.Vector3, heading: number, grabbable: (handle: number) => boolean): GrabTarget | null {
+export function findStaticGrab(
+  R: R,
+  world: World,
+  hp: THREE.Vector3,
+  heading: number,
+  grabbable: (handle: number) => boolean,
+  stableId?: (handle: number) => number | undefined,
+): GrabTarget | null {
   const fx = -Math.sin(heading);
   const fz = -Math.cos(heading);
   const filter = groups(0xffff, GROUP_ENV);
@@ -715,7 +1128,7 @@ export function findStaticGrab(R: R, world: World, hp: THREE.Vector3, heading: n
           const q = new THREE.Quaternion(r.x, r.y, r.z, r.w).invert();
           const local = new THREE.Vector3(origin.x - t.x, py + 0.02 - t.y, origin.z - t.z).applyQuaternion(q);
           const from = new THREE.Vector3(hp.x - t.x, hp.y - t.y, hp.z - t.z).applyQuaternion(q);
-          return { body: rb, localAnchor: local, isStatic: true, mass: 0, id: -1 - hit.collider.handle, snapFrom: from };
+          return { body: rb, localAnchor: local, isStatic: true, mass: 0, id: stableId?.(hit.collider.handle) ?? -1, snapFrom: from };
         }
       }
     }
@@ -731,7 +1144,7 @@ export function findStaticGrab(R: R, world: World, hp: THREE.Vector3, heading: n
         const r = rb.rotation();
         const q = new THREE.Quaternion(r.x, r.y, r.z, r.w).invert();
         const local = new THREE.Vector3(proj.point.x - t.x, proj.point.y - t.y, proj.point.z - t.z).applyQuaternion(q);
-        return { body: rb, localAnchor: local, isStatic: true, mass: 0, id: -1 - proj.collider.handle };
+        return { body: rb, localAnchor: local, isStatic: true, mass: 0, id: stableId?.(proj.collider.handle) ?? -1 };
       }
     }
   }
