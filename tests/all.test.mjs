@@ -1,0 +1,14 @@
+import "./commentary.test.mjs";
+import "./gameplay-matrix.test.mjs";
+import "./joystick.test.mjs";
+import "./round-transition.test.mjs";
+import "./mobile-input.test.mjs";
+import "./time.test.mjs";
+import "./leaderboard.test.mjs";
+import "./objective-proof.test.mjs";
+import "./simulation-clock.test.mjs";
+import "./remote-input-state.test.mjs";
+import "./snapshot-codec.test.mjs";
+import "./round-standings.test.mjs";
+import "./server-clock.test.mjs";
+import "./network-tuning.test.mjs";

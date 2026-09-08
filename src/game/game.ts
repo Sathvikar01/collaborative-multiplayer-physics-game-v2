@@ -1,28 +1,24 @@
 import * as THREE from "three";
 import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeometry.js";
 import type RAPIER_T from "@dimforge/rapier3d-compat";
-import { RagdollBody, PARTS, PART_COUNT, PELVIS, HEAD, CHEST, GROUP_ENV, GROUP_PROP, groups, findStaticGrab, type BodyEvent, type BodyInputs, type GrabTarget } from "./body";
+import { RagdollBody, PARTS, PART_COUNT, PELVIS, HEAD, CHEST, GROUP_ENV, GROUP_PROP, groups, findStaticGrab, type BodyEvent, type GrabTarget } from "./body";
 import { getLevel, type LevelDef, type PropDef, type ZoneDef } from "./levels";
 import { GameAudio } from "./audio";
 import type { Role, RoleInput, SquadSize } from "./types";
 import { makeSquadMixState, resolvePhysInputs, type SquadMixState } from "./squad";
-import { RemoteInputBuffer, normalizeRemoteInputs } from "./remoteInput";
 import {
-  CommentaryDirector,
-  isCommentaryCue,
-  isCommentarySnapshot,
-  type CommentaryCue,
-  type CommentaryEvent,
-  type CommentarySnapshot,
+  createCommentarySystem,
+  type CommentaryChallengeId,
+  type CommentaryFrame,
+  type CommentaryLine,
+  type CommentaryObjectiveEvent,
 } from "./commentary";
+import { FixedStepClock } from "./simulation-clock";
 import {
-  PhysicsReactor,
-  isPhysicsReactorSnapshot,
-  type ContactForceEvent as ReactorContactForceEvent,
-  type PhysicsDiagnostics,
-  type PhysicsReactorSnapshot,
-  type ReactorStepResult,
-} from "./physicsReactor";
+  SNAPSHOT_INTERPOLATION_DELAY_MS,
+  SNAPSHOT_SEND_INTERVAL_SECONDS,
+  snapshotExtrapolationSeconds,
+} from "./network-tuning";
 
 type R = typeof RAPIER_T;
 let RAPIER: R | null = null;
@@ -35,39 +31,32 @@ async function loadRapier(): Promise<R> {
   return R;
 }
 
-interface LevelEvent {
-  type: string;
-  pos: [number, number, number];
-  force?: number;
-  source?: "body" | "prop";
-  propId?: number;
+function usesCompactRenderProfile() {
+  return window.matchMedia("(pointer: coarse), (max-width: 900px)").matches;
 }
 
 export interface Snap {
   t: number;
   p: number[];
-  /** Optional per-part linear/angular velocities for host takeover. */
-  v?: number[];
-  av?: number[];
   props: number[];
-  /** Optional prop motion tuples: id, linear xyz, angular xyz. */
-  propMotion?: number[];
-  moverT?: number;
-  checkpointIdx?: number;
-  delivered?: boolean;
-  running?: boolean;
-  finished?: boolean;
   yaw: number;
   pitch: number;
   timer: number;
   fallen: number;
   score: number;
-  ev: (BodyEvent | LevelEvent)[];
+  ev: (BodyEvent | { type: string; pos: [number, number, number] })[];
   msg?: string;
-  commentary?: CommentaryCue;
-  commentaryState?: CommentarySnapshot;
-  /** Versioned active-ragdoll/controller state used during host takeover. */
-  reactor?: PhysicsReactorSnapshot;
+  state?: {
+    checkpoint: number;
+    delivered: boolean;
+    moverTime: number;
+    running: boolean;
+    finished: boolean;
+    frozen: boolean;
+    holds?: { hand: 0 | 1; propId: number }[];
+    bodyVelocities?: number[];
+    propVelocities?: number[];
+  };
 }
 
 export interface HudState {
@@ -82,18 +71,9 @@ export interface HudState {
   objective: string;
   running: boolean;
   finished: boolean;
-  stabilityMargin: number;
-  supportFeet: number;
-  gripStress: number;
-  fallReason: string | null;
 }
 
-export type GameEvent =
-  | { type: "finish"; timeMs: number }
-  | { type: "message"; text: string; tone?: "good" | "bad" | "info" }
-  | { type: "commentary"; cue: CommentaryCue }
-  | { type: "hud"; hud: HudState }
-  | { type: "shout"; teamId: number };
+export type GameEvent = { type: "finish"; timeMs: number } | { type: "message"; text: string; tone?: "good" | "bad" | "info" } | { type: "hud"; hud: HudState };
 
 export interface GameOptions {
   canvas: HTMLCanvasElement;
@@ -120,10 +100,6 @@ const tmpV = new THREE.Vector3();
 const tmpV2 = new THREE.Vector3();
 const tmpQ = new THREE.Quaternion();
 const tmpQ2 = new THREE.Quaternion();
-export const GUEST_INTERPOLATION_DELAY_MS = 90;
-export const GUEST_MAX_EXTRAPOLATION_MS = 130;
-const COMMENTARY_BROADCAST_TICKS = 60;
-const COMMENTARY_LEVEL_EVENTS = new Set(["checkpoint", "score", "finish", "splash", "crack"]);
 
 function lerpAngle(a: number, b: number, t: number) {
   let d = b - a;
@@ -139,16 +115,16 @@ class BodyView {
   pupils: THREE.Mesh[] = [];
   eyes: THREE.Mesh[] = [];
   mouth: THREE.Mesh = new THREE.Mesh();
-  beak: THREE.Mesh = new THREE.Mesh();
   hands: THREE.Mesh[] = [];
   materials: THREE.MeshStandardMaterial[] = [];
   label: THREE.Sprite | null = null;
   bubble: THREE.Sprite | null = null;
   bubbleT = 0;
   blinkT = 2;
-  quackT = 0;
+  private teamName: string;
 
   constructor(color: string, public ghost: boolean, teamName: string) {
+    this.teamName = teamName;
     const mat = (c: string, extra: Partial<THREE.MeshStandardMaterialParameters> = {}) => {
       const m = new THREE.MeshStandardMaterial({ color: c, roughness: 0.75, metalness: 0.02, ...extra });
       if (ghost) {
@@ -160,12 +136,10 @@ class BodyView {
       return m;
     };
     const team = mat(color);
-    const teamAccent = mat(new THREE.Color(color).offsetHSL(0, 0.08, 0.14).getStyle(), { roughness: 0.58 });
     const skin = mat(SKIN);
     const dark = mat("#2b2d42");
     const white = mat("#ffffff", { roughness: 0.5 });
     const shoe = mat("#f5f5f5", { roughness: 0.6 });
-    const beakMat = mat("#ff9a3c", { roughness: 0.62 });
 
     for (let i = 0; i < PART_COUNT; i++) {
       const spec = PARTS[i];
@@ -208,14 +182,9 @@ class BodyView {
           this.pupils.push(pupil);
         }
         this.mouth = new THREE.Mesh(new THREE.TorusGeometry(0.055, 0.012, 8, 14, Math.PI), dark);
-        this.mouth.position.set(0, -0.14, -0.16);
+        this.mouth.position.set(0, -0.06, -0.185);
         this.mouth.rotation.z = Math.PI;
         g.add(this.mouth);
-        this.beak = new THREE.Mesh(new THREE.ConeGeometry(0.085, 0.2, 4), beakMat);
-        this.beak.position.set(0, -0.055, -0.22);
-        this.beak.rotation.set(-Math.PI / 2, 0, Math.PI / 4);
-        this.beak.castShadow = !ghost;
-        g.add(this.beak);
         // cap
         const cap = new THREE.Mesh(new THREE.SphereGeometry(0.205, 24, 12, 0, Math.PI * 2, 0, Math.PI * 0.42), team);
         cap.position.y = 0.02;
@@ -237,21 +206,24 @@ class BodyView {
         const badge = new THREE.Mesh(new THREE.CircleGeometry(0.09, 20), white);
         badge.position.set(0, 0.1, -0.125);
         g.add(badge);
-        // A shallow chest plate and collar break up the toy-like silhouette while staying
-        // attached to the physics-driven chest part.
-        const chestPlate = new THREE.Mesh(new RoundedBoxGeometry(spec.size[0] * 1.55, spec.size[1] * 0.95, 0.035, 3, 0.02), teamAccent);
-        chestPlate.position.set(0, 0.02, -0.125);
-        chestPlate.castShadow = !ghost;
-        g.add(chestPlate);
-        const collar = new THREE.Mesh(new THREE.TorusGeometry(Math.max(0.12, spec.size[0] * 0.34), 0.025, 8, 20), teamAccent);
-        collar.rotation.x = Math.PI / 2;
-        collar.position.set(0, spec.size[1] * 0.48, 0);
-        collar.castShadow = !ghost;
-        g.add(collar);
       }
       this.parts.push(g);
       this.root.add(g);
     }
+  }
+
+  setTeamName(name: string, color: string) {
+    if (name === this.teamName) return;
+    this.teamName = name;
+    const previous = this.label;
+    if (!previous) return;
+    const next = makeTextSprite(name, color);
+    next.position.copy(previous.position);
+    next.scale.copy(previous.scale);
+    this.parts[HEAD].remove(previous);
+    disposeTextSprite(previous);
+    this.label = next;
+    this.parts[HEAD].add(next);
   }
 
   setTransforms(arr: ArrayLike<number>, offset = 0) {
@@ -270,14 +242,11 @@ class BodyView {
       p.position.y = THREE.MathUtils.lerp(p.position.y, lookPitch * 0.03, 0.2);
     }
     this.blinkT -= dt;
-    this.quackT = Math.max(0, this.quackT - dt);
     const sy = this.blinkT < 0 ? 0.15 : 1;
     if (this.blinkT < -0.12) this.blinkT = 2 + Math.random() * 3;
     for (const e of this.eyes) e.scale.y = THREE.MathUtils.lerp(e.scale.y, fallen ? 0.35 : sy, 0.5);
     this.mouth.scale.setScalar(fallen ? 0.6 : holding ? 1.3 : 1);
     this.mouth.rotation.z = fallen ? 0 : Math.PI;
-    const quack = this.quackT > 0 ? Math.sin((this.quackT / 0.38) * Math.PI * 4) : 0;
-    this.beak.rotation.x = -Math.PI / 2 + Math.max(0, quack) * 0.22;
     if (this.bubble) {
       this.bubbleT -= dt;
       this.bubble.visible = this.bubbleT > 0;
@@ -288,18 +257,21 @@ class BodyView {
   shout(text: string) {
     if (this.bubble) {
       this.parts[HEAD].remove(this.bubble);
-      disposeObject3D(this.bubble);
+      disposeTextSprite(this.bubble);
     }
     this.bubble = makeTextSprite(text, "#ffffff", "#222222");
     this.bubble.position.set(0.35, 0.95, 0);
     this.bubble.scale.set(1.6, 0.5, 1);
     this.bubbleT = 1.4;
-    this.quackT = 0.38;
     this.parts[HEAD].add(this.bubble);
   }
 
   dispose() {
-    disposeObject3D(this.root);
+    this.root.traverse((o) => {
+      if (o instanceof THREE.Mesh) o.geometry.dispose();
+      if (o instanceof THREE.Sprite) disposeTextSprite(o);
+    });
+    for (const m of this.materials) m.dispose();
   }
 }
 
@@ -319,16 +291,27 @@ function makeTextSprite(text: string, bg: string, fg = "#ffffff") {
   roundRect(ctx, 8, 8, 496, 112, 40);
   ctx.fill();
   ctx.fillStyle = fg;
-  ctx.font = "bold 64px system-ui, sans-serif";
+  const displayText = text.slice(0, 22);
+  let fontSize = 64;
+  ctx.font = `bold ${fontSize}px system-ui, sans-serif`;
+  while (fontSize > 34 && ctx.measureText(displayText).width > 440) {
+    fontSize -= 4;
+    ctx.font = `bold ${fontSize}px system-ui, sans-serif`;
+  }
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  ctx.fillText(text.slice(0, 16), 256, 66);
+  ctx.fillText(displayText, 256, 66);
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
   const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true });
   const s = new THREE.Sprite(mat);
   s.renderOrder = 10;
   return s;
+}
+
+function disposeTextSprite(sprite: THREE.Sprite) {
+  sprite.material.map?.dispose();
+  sprite.material.dispose();
 }
 function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
   ctx.beginPath();
@@ -338,55 +321,6 @@ function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: numbe
   ctx.arcTo(x, y + h, x, y, r);
   ctx.arcTo(x, y, x + w, y, r);
   ctx.closePath();
-}
-
-/** Small, deterministic surface variation keeps the level from looking like a set of flat primitives. */
-function makeSurfaceTexture(hex: string, seed = 1) {
-  const size = 128;
-  const canvas = document.createElement("canvas");
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext("2d")!;
-  // Canvas bytes are authored in sRGB. Three's working Color is linear, so
-  // convert it back before writing the color texture to avoid double-darkening.
-  const base = new THREE.Color(hex).convertLinearToSRGB();
-  const image = ctx.createImageData(size, size);
-  let state = (seed * 1664525 + 1013904223) >>> 0;
-  const random = () => {
-    state = (state * 1664525 + 1013904223) >>> 0;
-    return state / 4294967296;
-  };
-  for (let y = 0; y < size; y++) {
-    for (let x = 0; x < size; x++) {
-      // Subtle low-frequency variation breaks up flat primitives without the
-      // high-contrast, pixelated pattern of a conventional noise texture.
-      const broad = Math.sin(x * 0.075 + seed) * 0.009 + Math.sin(y * 0.052 + seed * 1.7) * 0.007;
-      const grain = (random() - 0.5) * 0.024 + broad;
-      const i = (y * size + x) * 4;
-      image.data[i] = Math.max(0, Math.min(255, Math.round((base.r + grain) * 255)));
-      image.data[i + 1] = Math.max(0, Math.min(255, Math.round((base.g + grain) * 255)));
-      image.data[i + 2] = Math.max(0, Math.min(255, Math.round((base.b + grain) * 255)));
-      image.data[i + 3] = 255;
-    }
-  }
-  ctx.putImageData(image, 0, 0);
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.wrapS = THREE.RepeatWrapping;
-  texture.wrapT = THREE.RepeatWrapping;
-  texture.repeat.set(2.5, 2.5);
-  texture.colorSpace = THREE.SRGBColorSpace;
-  texture.minFilter = THREE.LinearMipmapLinearFilter;
-  texture.magFilter = THREE.LinearFilter;
-  texture.anisotropy = 4;
-  return texture;
-}
-
-function makeSurfaceMaterial(hex: string, roughness: number, metalness = 0, seed = 1) {
-  const texture = makeSurfaceTexture(hex, seed);
-  const bump = texture.clone();
-  bump.colorSpace = THREE.NoColorSpace;
-  bump.needsUpdate = true;
-  return new THREE.MeshStandardMaterial({ map: texture, bumpMap: bump, bumpScale: 0.018, color: "#ffffff", roughness, metalness });
 }
 
 /* ---------------------------------- Particles ---------------------------------- */
@@ -471,6 +405,13 @@ class Particles {
     }
     this.mesh.instanceMatrix.needsUpdate = true;
   }
+
+  dispose() {
+    this.mesh.removeFromParent();
+    this.mesh.geometry.dispose();
+    const materials = Array.isArray(this.mesh.material) ? this.mesh.material : [this.mesh.material];
+    for (const material of materials) material.dispose();
+  }
 }
 
 /* ---------------------------------- Props ---------------------------------- */
@@ -489,7 +430,6 @@ type RigidBodyT = RAPIER_T.RigidBody;
 interface TeamGhost {
   view: BodyView;
   buffer: { recv: number; snap: Snap }[];
-  transforms: number[];
   lastEvT: number;
 }
 
@@ -508,12 +448,8 @@ export class Game {
   levelGroup = new THREE.Group();
   staticBodies: RigidBodyT[] = [];
   nonGrabHandles = new Set<number>();
-  staticGrabIdByCollider = new Map<number, number>();
-  staticGrabBodyById = new Map<number, RigidBodyT>();
   props: Prop[] = [];
   body: RagdollBody | null = null;
-  reactor: PhysicsReactor | null = null;
-  physicsDiagnostics: PhysicsDiagnostics | null = null;
   view: BodyView;
   ghosts = new Map<number, TeamGhost>();
   ownBuffer: { recv: number; snap: Snap }[] = [];
@@ -521,15 +457,19 @@ export class Game {
   teamId: number;
   teamColor: string;
   teamName = "Team";
-  private readonly remoteInputBuffer = new RemoteInputBuffer();
+  remoteInputs: Partial<Record<Role, RoleInput>> = {};
   localInputs: Partial<Record<Role, RoleInput>> = {};
   squadSize: SquadSize = 5;
   squadMix: SquadMixState = makeSquadMixState();
+  commentary = createCommentarySystem();
+  commentaryInputs: Partial<Record<Role, RoleInput>> = {};
+  commentaryRun = 0;
   movers: Mover[] = [];
   moverT = 0;
   delivered = false;
   denyCooldown = 0;
   skyMat: THREE.ShaderMaterial | null = null;
+  sky: THREE.Mesh | null = null;
   onEvent: GameOptions["onEvent"];
   // camera
   camYaw = 0;
@@ -546,17 +486,15 @@ export class Game {
   lastFrame = 0;
   raf = 0;
   fixedDt = 1 / 120;
+  // Foreground hosts stay real-time down to 1 FPS. Longer discontinuities are
+  // bounded to one second; hidden hosts proactively yield to a teammate.
+  simulationClock = new FixedStepClock(this.fixedDt, 120, 1);
   sendAcc = 0;
   pendingEvents: Snap["ev"] = [];
   pendingMsg: string | undefined;
-  private readonly commentary = new CommentaryDirector();
-  private activeCommentary: CommentaryCue | null = null;
-  private commentaryBroadcastUntilTick = -1;
-  private lastReceivedCommentaryId: string | null = null;
-  private commentaryStartEvent: "start" | "retry" | null = null;
-  private commentaryRunCount = 0;
   hudAcc = 0;
   disposed = false;
+  delayedEffects = new Set<ReturnType<typeof setTimeout>>();
   displayYaw = 0;
   displayPitch = 0;
   displayFallen = false;
@@ -566,10 +504,7 @@ export class Game {
   deliverPad: THREE.Mesh | null = null;
   checkpointMeshes: THREE.Mesh[] = [];
   water: THREE.Mesh | null = null;
-  waterMat: THREE.ShaderMaterial | null = null;
   onSnapshot: ((s: Snap) => void) | null = null;
-  onBodyEvent: ((ev: BodyEvent) => void) | null = null;
-  private readonly scheduledTimeouts = new Set<ReturnType<typeof setTimeout>>();
 
   static async create(opts: GameOptions) {
     const R = await loadRapier();
@@ -587,61 +522,37 @@ export class Game {
     this.teamColor = opts.teamColor;
     this.squadSize = opts.squadSize === 3 ? 3 : 5;
     const canvas = opts.canvas;
+    const compactRenderProfile = usesCompactRenderProfile();
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.75));
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, compactRenderProfile ? 1.35 : 1.75));
     this.renderer.shadowMap.enabled = true;
-    // In current Three releases PCFShadowMap is the filtered PCF path (the old
-    // PCFSoftShadowMap alias is deprecated).
     this.renderer.shadowMap.type = THREE.PCFShadowMap;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.0;
+    this.renderer.toneMappingExposure = 1.05;
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.camera = new THREE.PerspectiveCamera(58, 1, 0.1, 300);
-    this.scene.fog = new THREE.Fog(new THREE.Color("#a7b6b4"), 42, 150);
+    this.scene.fog = new THREE.Fog(new THREE.Color("#cfe3ff"), 45, 160);
 
     // sky dome
     const skyGeo = new THREE.SphereGeometry(200, 24, 12);
     const skyMat = new THREE.ShaderMaterial({
       side: THREE.BackSide,
       depthWrite: false,
-      uniforms: {
-        top: { value: new THREE.Color("#416684") },
-        mid: { value: new THREE.Color("#8aa5b2") },
-        bot: { value: new THREE.Color("#d8d0bd") },
-        sunDir: { value: new THREE.Vector3(0.45, 0.78, 0.3).normalize() },
-        sunColor: { value: new THREE.Color("#fff0cf") },
-      },
+      uniforms: { top: { value: new THREE.Color("#3f7fe0") }, mid: { value: new THREE.Color("#8fc2ff") }, bot: { value: new THREE.Color("#e6f1ff") } },
       vertexShader: `varying vec3 vW; void main(){ vW = (modelMatrix * vec4(position,1.0)).xyz; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
-      fragmentShader: `
-        uniform vec3 top; uniform vec3 mid; uniform vec3 bot; uniform vec3 sunDir; uniform vec3 sunColor;
-        varying vec3 vW;
-        void main(){
-          vec3 dir = normalize(vW); float h = dir.y;
-          vec3 c = h > 0.0 ? mix(mid, top, pow(h, 0.72)) : mix(mid, bot, clamp(-h * 4.0, 0.0, 1.0));
-          float horizon = exp(-abs(h) * 8.0);
-          c = mix(c, c * 1.18 + vec3(0.035, 0.045, 0.07), horizon * 0.28);
-          float sun = pow(max(dot(dir, normalize(sunDir)), 0.0), 240.0);
-          float glow = pow(max(dot(dir, normalize(sunDir)), 0.0), 8.0) * 0.16;
-          c += sunColor * (sun * 1.4 + glow);
-          gl_FragColor = vec4(c, 1.0);
-        }`,
+      fragmentShader: `uniform vec3 top; uniform vec3 mid; uniform vec3 bot; varying vec3 vW; void main(){ float h = normalize(vW).y; vec3 c = h > 0.0 ? mix(mid, top, pow(h, 0.7)) : mix(mid, bot, clamp(-h*4.0,0.0,1.0)); gl_FragColor = vec4(c,1.0); }`,
     });
     const sky = new THREE.Mesh(skyGeo, skyMat);
     sky.frustumCulled = false;
     this.scene.add(sky);
+    this.sky = sky;
     this.skyMat = skyMat;
 
     const hemi = new THREE.HemisphereLight("#cfe4ff", "#5f8a4a", 0.75);
     this.scene.add(hemi);
-    const fill = new THREE.DirectionalLight("#a9c8ff", 0.42);
-    fill.position.set(-24, 18, -18);
-    this.scene.add(fill);
-    const rim = new THREE.DirectionalLight("#ffd4b0", 0.3);
-    rim.position.set(-10, 12, 28);
-    this.scene.add(rim);
     this.sun = new THREE.DirectionalLight("#fff4e0", 2.2);
     this.sun.castShadow = true;
-    this.sun.shadow.mapSize.set(2048, 2048);
+    this.sun.shadow.mapSize.set(compactRenderProfile ? 1024 : 2048, compactRenderProfile ? 1024 : 2048);
     this.sun.shadow.camera.near = 1;
     this.sun.shadow.camera.far = 120;
     this.sun.shadow.camera.left = -22;
@@ -653,57 +564,13 @@ export class Game {
     this.scene.add(this.sun);
     this.scene.add(this.sun.target);
 
-    // Water is an inexpensive procedural wave surface. The two overlapping wave
-    // bands and fresnel edge tint give it believable motion without textures.
-    const waterMat = new THREE.ShaderMaterial({
-      uniforms: {
-        time: { value: 0 },
-        waterColor: { value: new THREE.Color("#2b6678") },
-        deepColor: { value: new THREE.Color("#0c3e73") },
-        sunColor: { value: new THREE.Color("#fff1cf") },
-      },
-      vertexShader: `
-        uniform float time; varying vec3 vWorld; varying vec3 vNormal; varying float vWave;
-        void main(){
-          vec3 p = position;
-          float w1 = sin(p.x * 0.12 + time * 0.75) * 0.09;
-          float w2 = sin(p.y * 0.18 - time * 0.48 + p.x * 0.055) * 0.055;
-          float w3 = sin((p.x + p.y) * 0.31 + time * 1.25) * 0.018;
-          float dx = cos(p.x * 0.12 + time * 0.75) * 0.0108
-                   + cos(p.y * 0.18 - time * 0.48 + p.x * 0.055) * 0.003025
-                   + cos((p.x + p.y) * 0.31 + time * 1.25) * 0.00558;
-          float dy = cos(p.y * 0.18 - time * 0.48 + p.x * 0.055) * 0.0099
-                   + cos((p.x + p.y) * 0.31 + time * 1.25) * 0.00558;
-          p.z += w1 + w2 + w3; vWave = w1 + w2 + w3;
-          vec4 world = modelMatrix * vec4(p, 1.0); vWorld = world.xyz;
-          vNormal = normalize(mat3(modelMatrix) * normalize(vec3(-dx, -dy, 1.0)));
-          gl_Position = projectionMatrix * viewMatrix * world;
-        }`,
-      fragmentShader: `
-        uniform vec3 waterColor; uniform vec3 deepColor; uniform vec3 sunColor;
-        varying vec3 vWorld; varying vec3 vNormal; varying float vWave;
-        void main(){
-          vec3 viewDir = normalize(cameraPosition - vWorld);
-          vec3 normal = normalize(vNormal);
-          vec3 lightDir = normalize(vec3(0.45, 0.78, 0.3));
-          float fresnel = pow(1.0 - max(dot(viewDir, normal), 0.0), 3.0);
-          float specular = pow(max(dot(reflect(-lightDir, normal), viewDir), 0.0), 96.0);
-          float ripple = smoothstep(0.01, 0.08, abs(vWave)) * 0.10;
-          vec3 c = mix(deepColor, waterColor, 0.58 + fresnel * 0.34);
-          c += sunColor * (fresnel * 0.18 + ripple + specular * 0.48);
-          gl_FragColor = vec4(c, 0.9);
-        }`,
-      transparent: true,
-      depthWrite: false,
-      side: THREE.DoubleSide,
-    });
-    const water = new THREE.Mesh(new THREE.PlaneGeometry(600, 600, 64, 64), waterMat);
+    // water
+    const water = new THREE.Mesh(new THREE.PlaneGeometry(600, 600, 1, 1), new THREE.MeshStandardMaterial({ color: "#2f8fe0", roughness: 0.25, metalness: 0.1 }));
     water.rotation.x = -Math.PI / 2;
     water.position.y = -3;
     water.receiveShadow = true;
     this.scene.add(water);
     this.water = water;
-    this.waterMat = waterMat;
 
     this.scene.add(this.levelGroup);
     this.particles = new Particles(this.scene);
@@ -712,12 +579,22 @@ export class Game {
 
     this.resize();
     window.addEventListener("resize", this.resize);
+    window.addEventListener("blur", this.releaseLocalControls);
+    document.addEventListener("visibilitychange", this.releaseLocalControls);
   }
+
+  private releaseLocalControls = () => {
+    this.localInputs = {};
+    this.simulationClock.reset();
+    this.lastFrame = performance.now();
+  };
 
   resize = () => {
     const c = this.renderer.domElement;
     const w = c.clientWidth || window.innerWidth;
     const h = c.clientHeight || window.innerHeight;
+    const pixelRatio = Math.min(window.devicePixelRatio, usesCompactRenderProfile() ? 1.35 : 1.75);
+    if (Math.abs(this.renderer.getPixelRatio() - pixelRatio) > 0.01) this.renderer.setPixelRatio(pixelRatio);
     this.renderer.setSize(w, h, false);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
@@ -726,46 +603,82 @@ export class Game {
   setTeamName(name: string) {
     if (name === this.teamName) return;
     this.teamName = name;
-    if (this.view.label) {
-      const s = makeTextSprite(name, this.teamColor);
-      s.position.copy(this.view.label.position);
-      s.scale.copy(this.view.label.scale);
-      const previous = this.view.label;
-      this.view.parts[HEAD].remove(previous);
-      disposeObject3D(previous);
-      this.view.label = s;
-      this.view.parts[HEAD].add(s);
-    }
+    this.view.setTeamName(name, this.teamColor);
   }
 
-  /** Keep local rendering/authority metadata in sync when the room reassigns a team. */
-  setTeamIdentity(teamId: number, color: string, name: string) {
-    const colorChanged = color !== this.teamColor;
-    this.teamId = teamId;
-    if (!colorChanged) {
+  /** Rebind the local renderer and simulation after a lobby team switch. */
+  setTeam(teamId: number, color: string, name: string) {
+    if (teamId === this.teamId && color === this.teamColor) {
       this.setTeamName(name);
       return;
     }
-    const previous = this.view;
-    this.scene.remove(previous.root);
-    const next = new BodyView(color, false, name);
-    next.setTransforms(this.displayTransforms);
-    next.setFace(0, this.displayYaw, this.displayPitch, this.pelvisYawFromDisplay(), this.displayFallen, this.displayHolding > 0);
-    this.scene.add(next.root);
-    this.view = next;
+
+    this.teamId = teamId;
     this.teamColor = color;
     this.teamName = name;
+    this.ownBuffer = [];
+    this.remoteInputs = {};
+    this.localInputs = {};
+    this.commentaryInputs = {};
+
+    const previous = this.view;
+    const replacement = new BodyView(color, false, name);
+    replacement.setTransforms(this.displayTransforms);
+    this.scene.add(replacement.root);
+    this.scene.remove(previous.root);
     previous.dispose();
+    this.view = replacement;
+
+    // Team changes are lobby-only. Reset the private physics copy so the new
+    // team starts at its own spawn instead of inheriting the old team's pose.
+    if (this.R && this.level) {
+      const levelId = this.level.id;
+      this.setLevel(levelId);
+      this.freeRoam();
+    }
+  }
+
+  private scheduleEffect(callback: () => void, delayMs: number) {
+    const timeoutId = setTimeout(() => {
+      this.delayedEffects.delete(timeoutId);
+      if (!this.disposed) callback();
+    }, delayMs);
+    this.delayedEffects.add(timeoutId);
+  }
+
+  private clearDelayedEffects() {
+    for (const timeoutId of this.delayedEffects) clearTimeout(timeoutId);
+    this.delayedEffects.clear();
   }
 
   /* ------------------------------- Level ------------------------------- */
+  private disposeLevelAssets() {
+    const geometries = new Set<THREE.BufferGeometry>();
+    const materials = new Set<THREE.Material>();
+    const textures = new Set<THREE.Texture>();
+    this.levelGroup.traverse((object) => {
+      if (!(object instanceof THREE.Mesh)) return;
+      geometries.add(object.geometry);
+      const meshMaterials = Array.isArray(object.material) ? object.material : [object.material];
+      for (const material of meshMaterials) {
+        materials.add(material);
+        for (const value of Object.values(material)) {
+          if (value instanceof THREE.Texture) textures.add(value);
+        }
+      }
+    });
+    for (const texture of textures) texture.dispose();
+    for (const geometry of geometries) geometry.dispose();
+    for (const material of materials) material.dispose();
+    this.levelGroup.clear();
+  }
+
   setLevel(levelId: string) {
-    this.cancelScheduledTimeouts();
+    this.clearDelayedEffects();
     this.level = getLevel(levelId);
+    this.commentary.reset(`${this.teamId}:${this.level.id}:level`);
+    this.commentaryInputs = {};
     // reset physics world entirely
-    this.reactor?.dispose();
-    this.reactor = null;
-    if (this.body) this.body.dispose();
     if (this.eventQueue) this.eventQueue.free();
     if (this.world) this.world.free();
     const R = this.R;
@@ -773,14 +686,10 @@ export class Game {
     this.world.timestep = this.fixedDt;
     this.eventQueue = new R.EventQueue(true);
     this.body = null;
-    this.physicsDiagnostics = null;
     this.staticBodies = [];
     this.nonGrabHandles.clear();
-    this.staticGrabIdByCollider.clear();
-    this.staticGrabBodyById.clear();
     this.props = [];
-    disposeObject3D(this.levelGroup);
-    this.levelGroup.clear();
+    this.disposeLevelAssets();
     this.checkpointMeshes = [];
     this.finishGate = null;
     this.deliverPad = null;
@@ -793,56 +702,49 @@ export class Game {
     this.timer = 0;
     this.running = false;
     this.finished = false;
-    this.commentaryRunCount = 0;
-    this.resetCommentary();
 
     const L = this.level;
     // per-level sky + water tint (falls back to day blue)
     if (this.skyMat) {
-      const sky = L.sky ?? { top: "#416684", mid: "#8aa5b2", bot: "#d8d0bd", fog: "#a7b6b4" };
+      const sky = L.sky ?? { top: "#3f7fe0", mid: "#8fc2ff", bot: "#e6f1ff", fog: "#cfe3ff" };
       this.skyMat.uniforms.top.value.set(sky.top);
       this.skyMat.uniforms.mid.value.set(sky.mid);
       this.skyMat.uniforms.bot.value.set(sky.bot);
-      this.scene.fog = new THREE.Fog(new THREE.Color(sky.fog), 42, 150);
+      this.scene.fog = new THREE.Fog(new THREE.Color(sky.fog), 45, 160);
     }
     if (this.water) {
-      const waterColor = L.water ?? "#2b6678";
-      if (this.waterMat) {
-        this.waterMat.uniforms.waterColor.value.set(waterColor);
-        this.waterMat.uniforms.deepColor.value.copy(new THREE.Color(waterColor).multiplyScalar(0.34));
-      }
+      (this.water.material as THREE.MeshStandardMaterial).color.set(L.water ?? "#2f8fe0");
       this.water.position.y = L.killY < -3 ? -4 : -3;
     }
     for (const s of L.statics) {
       const rot = new THREE.Euler(s.rot?.[0] ?? 0, s.rot?.[1] ?? 0, s.rot?.[2] ?? 0);
       const q = new THREE.Quaternion().setFromEuler(rot);
       const isMover = Boolean(s.slide);
+      const moverPhase = s.slide?.phase ?? 0;
+      const initialOffset = isMover ? Math.sin(moverPhase) * s.slide!.dist : 0;
+      const initialX = s.pos[0] + (s.slide?.axis === "x" ? initialOffset : 0);
+      const initialZ = s.pos[2] + (s.slide?.axis === "z" ? initialOffset : 0);
       const desc = isMover
-        ? R.RigidBodyDesc.kinematicVelocityBased().setTranslation(s.pos[0], s.pos[1], s.pos[2]).setRotation({ x: q.x, y: q.y, z: q.z, w: q.w })
+        ? R.RigidBodyDesc.kinematicVelocityBased().setTranslation(initialX, s.pos[1], initialZ).setRotation({ x: q.x, y: q.y, z: q.z, w: q.w })
         : R.RigidBodyDesc.fixed().setTranslation(s.pos[0], s.pos[1], s.pos[2]).setRotation({ x: q.x, y: q.y, z: q.z, w: q.w });
       const rb = this.world.createRigidBody(desc);
       const col = this.world.createCollider(R.ColliderDesc.cuboid(s.size[0] / 2, s.size[1] / 2, s.size[2] / 2).setFriction(0.9).setCollisionGroups(groups(GROUP_ENV, 0xffff)), rb);
       if (s.grab === false) this.nonGrabHandles.add(col.handle);
-      const staticGripId = -1 - this.staticBodies.length;
       this.staticBodies.push(rb);
-      if (s.grab !== false) {
-        this.staticGrabIdByCollider.set(col.handle, staticGripId);
-        this.staticGrabBodyById.set(staticGripId, rb);
-      }
-      const side = makeSurfaceMaterial(s.color ?? "#999", 0.82, 0, this.level.id.length * 31 + this.staticBodies.length);
-      const top = makeSurfaceMaterial(s.top ?? s.color ?? "#bbb", 0.7, 0, this.level.id.length * 37 + this.staticBodies.length + 1);
+      const side = new THREE.MeshStandardMaterial({ color: s.color ?? "#999", roughness: 0.85 });
+      const top = new THREE.MeshStandardMaterial({ color: s.top ?? s.color ?? "#bbb", roughness: 0.85 });
       const mesh = new THREE.Mesh(new THREE.BoxGeometry(s.size[0], s.size[1], s.size[2]), [side, side, top, side, side, side]);
-      mesh.position.set(s.pos[0], s.pos[1], s.pos[2]);
+      mesh.position.set(initialX, s.pos[1], initialZ);
       mesh.quaternion.copy(q);
       mesh.castShadow = true;
       mesh.receiveShadow = true;
       this.levelGroup.add(mesh);
-      if (isMover) this.movers.push({ rb, mesh, base: new THREE.Vector3(s.pos[0], s.pos[1], s.pos[2]), axis: s.slide!.axis, dist: s.slide!.dist, speed: s.slide!.speed, phase: s.slide!.phase ?? 0 });
+      if (isMover) this.movers.push({ rb, mesh, base: new THREE.Vector3(s.pos[0], s.pos[1], s.pos[2]), axis: s.slide!.axis, dist: s.slide!.dist, speed: s.slide!.speed, phase: moverPhase });
       if (s.kind === "ground" || s.kind === "block") {
         // decorative edge stripe
         const stripe = new THREE.Mesh(
           new THREE.BoxGeometry(s.size[0] + 0.02, 0.08, s.size[2] + 0.02),
-          makeSurfaceMaterial(new THREE.Color(s.top ?? "#fff").multiplyScalar(0.85).getStyle(), 0.88, 0, this.staticBodies.length + 11)
+          new THREE.MeshStandardMaterial({ color: new THREE.Color(s.top ?? "#fff").multiplyScalar(0.85), roughness: 0.9 })
         );
         stripe.position.set(s.pos[0], s.pos[1] + s.size[1] / 2 - 0.12, s.pos[2]);
         stripe.quaternion.copy(q);
@@ -1038,117 +940,100 @@ export class Game {
 
   /* ------------------------------- Body ------------------------------- */
   spawnBody(pos: THREE.Vector3, yaw: number) {
-    this.reactor?.dispose();
-    this.reactor = null;
     if (this.body) this.body.dispose();
     this.body = new RagdollBody(this.R, this.world, pos, yaw);
     this.body.findGrab = (hp, exclude) => this.findGrab(hp, exclude);
     this.body.inputs.head.lx = yaw;
-    this.reactor = new PhysicsReactor({
-      rapier: this.R,
-      world: this.world,
-      eventQueue: this.eventQueue,
-      body: this.body,
-      stepHz: 1 / this.fixedDt,
-      maxSubsteps: 12,
-      maxDebtSeconds: 0.25,
-      resolveGripTargetHandle: (grip) => {
-        if (grip.isStatic) return this.staticGrabBodyById.get(grip.id)?.handle;
-        return this.props.find((prop) => prop.id === grip.id)?.body?.handle;
-      },
-    });
   }
 
   setHost(isHost: boolean) {
     if (isHost === this.isHost) return;
     this.isHost = isHost;
     if (isHost) {
-      // Rebuild the Rapier world with authoritative state from the latest host
-      // snapshot. A checkpoint-only respawn loses props/objectives and causes a
-      // visible teleport whenever the old host disconnects.
-      const last = validateSnapshot(this.ownBuffer[this.ownBuffer.length - 1]?.snap);
-      const yaw = last?.yaw ?? this.level.spawnYaw;
-      const wasRunning = last?.running ?? this.running;
+      // Rebuild authoritative physics, then restore the complete last received
+      // pose/objective state instead of restarting at a checkpoint.
+      const last = this.ownBuffer[this.ownBuffer.length - 1]?.snap;
+      const cp = this.level.checkpoints[this.checkpointIdx];
+      const fallbackState = {
+        checkpoint: this.checkpointIdx,
+        delivered: this.delivered,
+        moverTime: this.moverT,
+        running: this.running,
+        finished: this.finished,
+        frozen: this.frozen,
+      };
       this.setLevel(this.level.id);
-      if (!this.body) this.spawnBody(new THREE.Vector3(...this.level.spawn), yaw);
-      if (last) this.restoreTakeoverSnapshot(last);
-      this.timer = last?.timer ?? this.timer;
-      this.score = last?.score ?? this.score;
-      this.running = wasRunning;
-      this.finished = last?.finished ?? false;
-      this.frozen = !this.running;
-      if (this.body) this.body.frozen = this.frozen;
-      this.remoteInputBuffer.clear();
+      if (last) this.restoreAuthoritativeSnapshot(last);
+      else {
+        if (cp?.spawn) this.body?.teleport(new THREE.Vector3(...cp.spawn), this.level.spawnYaw);
+        this.restoreObjectiveState(fallbackState);
+      }
+      this.simulationClock.reset();
     } else {
-      this.reactor?.dispose();
-      this.reactor = null;
       if (this.body) this.body.dispose();
       this.body = null;
-      this.physicsDiagnostics = null;
     }
   }
 
-  private restoreTakeoverSnapshot(s: Snap) {
-    const body = this.body;
-    if (!body || !validTransforms(s.p)) return;
-    for (let i = 0; i < PART_COUNT; i++) {
-      const o = i * 7;
-      const q = normalizedQuat(s.p[o + 3], s.p[o + 4], s.p[o + 5], s.p[o + 6]);
-      if (!q) continue;
-      const rb = body.parts[i];
-      rb.setTranslation({ x: s.p[o], y: s.p[o + 1], z: s.p[o + 2] }, true);
-      rb.setRotation(q, true);
-      if (s.v && s.v.length === PART_COUNT * 3) rb.setLinvel({ x: s.v[i * 3], y: s.v[i * 3 + 1], z: s.v[i * 3 + 2] }, true);
-      if (s.av && s.av.length === PART_COUNT * 3) rb.setAngvel({ x: s.av[i * 3], y: s.av[i * 3 + 1], z: s.av[i * 3 + 2] }, true);
+  private restoreObjectiveState(state: NonNullable<Snap["state"]>) {
+    this.checkpointIdx = state.checkpoint;
+    this.delivered = state.delivered;
+    this.moverT = state.moverTime;
+    this.running = state.running;
+    this.finished = state.finished;
+    this.frozen = state.frozen;
+    for (let i = 0; i < this.checkpointMeshes.length; i++) {
+      (this.checkpointMeshes[i].material as THREE.MeshStandardMaterial).color.set(i <= state.checkpoint ? "#6ef29a" : "#ffd23f");
     }
-    body.heading = s.yaw;
-    body.pelvisYaw = s.yaw;
-    body.headPitch = s.pitch;
-    body.fallen = s.fallen === 1;
-    body.writeTransforms(this.displayTransforms);
-    this.displayYaw = s.yaw;
-    this.displayPitch = s.pitch;
-    this.displayFallen = body.fallen;
+    for (const mover of this.movers) {
+      const offset = Math.sin(this.moverT * mover.speed + mover.phase) * mover.dist;
+      const x = mover.base.x + (mover.axis === "x" ? offset : 0);
+      const z = mover.base.z + (mover.axis === "z" ? offset : 0);
+      mover.rb.setTranslation({ x, y: mover.base.y, z }, true);
+      mover.rb.setLinvel({ x: 0, y: 0, z: 0 }, true);
+      mover.mesh.position.set(x, mover.base.y, z);
+    }
+    if (this.body) this.body.frozen = state.frozen;
+  }
 
-    const motion = new Map<number, number[]>();
-    if (s.propMotion) {
-      for (let i = 0; i + 6 < s.propMotion.length; i += 7) motion.set(s.propMotion[i], s.propMotion.slice(i + 1, i + 7));
+  private restoreAuthoritativeSnapshot(snapshot: Snap) {
+    if (!this.body) return;
+    this.body.restoreTransforms(snapshot.p, snapshot.yaw, snapshot.pitch, snapshot.fallen === 1, snapshot.state?.bodyVelocities);
+    this.displayTransforms = [...snapshot.p];
+    this.displayYaw = snapshot.yaw;
+    this.displayPitch = snapshot.pitch;
+    this.displayFallen = snapshot.fallen === 1;
+    this.timer = snapshot.timer;
+    this.score = snapshot.score;
+    for (let offset = 0; offset + 7 < snapshot.props.length; offset += 8) {
+      const prop = this.props.find((candidate) => candidate.id === snapshot.props[offset]);
+      if (!prop?.body) continue;
+      prop.body.setTranslation({ x: snapshot.props[offset + 1], y: snapshot.props[offset + 2], z: snapshot.props[offset + 3] }, true);
+      prop.body.setRotation({ x: snapshot.props[offset + 4], y: snapshot.props[offset + 5], z: snapshot.props[offset + 6], w: snapshot.props[offset + 7] }, true);
+      const velocityOffset = snapshot.state?.propVelocities?.findIndex((value, index) => index % 7 === 0 && value === prop.id) ?? -1;
+      if (velocityOffset >= 0 && snapshot.state?.propVelocities) {
+        const velocities = snapshot.state.propVelocities;
+        prop.body.setLinvel({ x: velocities[velocityOffset + 1], y: velocities[velocityOffset + 2], z: velocities[velocityOffset + 3] }, true);
+        prop.body.setAngvel({ x: velocities[velocityOffset + 4], y: velocities[velocityOffset + 5], z: velocities[velocityOffset + 6] }, true);
+      } else {
+        prop.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+        prop.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+      }
+      prop.mesh.position.set(snapshot.props[offset + 1], snapshot.props[offset + 2], snapshot.props[offset + 3]);
+      prop.mesh.quaternion.set(snapshot.props[offset + 4], snapshot.props[offset + 5], snapshot.props[offset + 6], snapshot.props[offset + 7]);
     }
-    for (let i = 0; i + 7 < s.props.length; i += 8) {
-      const p = this.props.find((x) => x.id === s.props[i]);
-      if (!p?.body) continue;
-      const q = normalizedQuat(s.props[i + 4], s.props[i + 5], s.props[i + 6], s.props[i + 7]);
-      if (!q) continue;
-      p.body.setTranslation({ x: s.props[i + 1], y: s.props[i + 2], z: s.props[i + 3] }, true);
-      p.body.setRotation(q, true);
-      const mv = motion.get(p.id);
-      if (mv) {
-        p.body.setLinvel({ x: mv[0], y: mv[1], z: mv[2] }, true);
-        p.body.setAngvel({ x: mv[3], y: mv[4], z: mv[5] }, true);
+    if (snapshot.state) {
+      this.restoreObjectiveState(snapshot.state);
+      for (const held of snapshot.state.holds ?? []) {
+        if (held.propId < 0) {
+          this.body.restoreStaticHold(held.hand, held.propId);
+        } else {
+          const prop = this.props.find((candidate) => candidate.id === held.propId);
+          if (prop?.body) this.body.restoreDynamicHold(held.hand, prop.body, prop.id, prop.def.mass);
+        }
       }
     }
-    if (Number.isFinite(s.moverT)) this.moverT = s.moverT!;
-    if (Number.isInteger(s.checkpointIdx)) this.checkpointIdx = Math.max(-1, Math.min(this.level.checkpoints.length - 1, s.checkpointIdx!));
-    this.delivered = s.delivered === true;
-    for (const f of this.checkpointMeshes) (f.material as THREE.MeshStandardMaterial).color.set("#ffd23f");
-    for (let i = 0; i <= this.checkpointIdx; i++) (this.checkpointMeshes[i].material as THREE.MeshStandardMaterial).color.set("#6ef29a");
-    for (const m of this.movers) {
-      const off = Math.sin(this.moverT * m.speed + m.phase) * m.dist;
-      const x = m.base.x + (m.axis === "x" ? off : 0);
-      const z = m.base.z + (m.axis === "z" ? off : 0);
-      m.rb.setTranslation({ x, y: m.base.y, z }, true);
-      m.rb.setLinvel({ x: 0, y: 0, z: 0 }, true);
-      m.mesh.position.set(x, m.base.y, z);
-    }
-    const reactorRestored = s.reactor ? this.reactor?.restore(s.reactor) === true : false;
-    const commentaryRestored = reactorRestored
-      && !!s.commentaryState
-      && s.commentaryState.lastTick === this.reactor?.currentTick
-      && this.commentary.restore(s.commentaryState);
-    if (!commentaryRestored) this.commentary.reset();
-    this.activeCommentary = commentaryRestored ? s.commentary ?? null : null;
-    this.commentaryBroadcastUntilTick = commentaryRestored && s.commentary ? s.commentary.tick + COMMENTARY_BROADCAST_TICKS : -1;
-    this.lastReceivedCommentaryId = commentaryRestored ? s.commentary?.id ?? null : null;
+    this.displayHolding = this.body.holds.length;
   }
 
   private findGrab(hp: THREE.Vector3, exclude: number[]): GrabTarget | null {
@@ -1170,45 +1055,28 @@ export class Game {
       }
     }
     if (best) return best;
-    return findStaticGrab(
-      this.R,
-      this.world,
-      hp,
-      this.body?.heading ?? 0,
-      (handle) => !this.nonGrabHandles.has(handle),
-      (handle) => this.staticGrabIdByCollider.get(handle),
-    );
+    return findStaticGrab(this.R, this.world, hp, this.body?.heading ?? 0, (h) => !this.nonGrabHandles.has(h));
   }
 
   /* ------------------------------- Inputs ------------------------------- */
   setLocalInput(role: Role, input: RoleInput) {
     this.localInputs[role] = input;
   }
-  /** Refresh one player's lease; the one-argument form supports old relays. */
-  setRemoteInputs(playerId: string, inputs: unknown): void;
-  setRemoteInputs(inputs: Partial<Record<Role, RoleInput>>): void;
-  setRemoteInputs(playerIdOrInputs: string | Partial<Record<Role, RoleInput>>, maybeInputs?: unknown) {
-    const playerId = typeof playerIdOrInputs === "string" ? playerIdOrInputs : "__legacy__";
-    const inputs = typeof playerIdOrInputs === "string" ? maybeInputs : playerIdOrInputs;
-    this.remoteInputBuffer.set(playerId, normalizeRemoteInputs(inputs));
+  setRemoteInputs(inputs: Partial<Record<Role, RoleInput>>) {
+    // A remote update is a complete state description, never a patch.
+    this.remoteInputs = { ...inputs };
   }
-  clearRemoteInputs(playerId?: string) {
-    this.remoteInputBuffer.clear(playerId);
+  clearRemoteInputs() {
+    this.remoteInputs = {};
+  }
+  clearOwnSnapshots() {
+    this.ownBuffer = [];
   }
 
   /* ------------------------------- Flow ------------------------------- */
-  private resetCommentary(preservePhrases = false) {
-    this.commentary.reset({ preservePhrases });
-    this.activeCommentary = null;
-    this.commentaryBroadcastUntilTick = -1;
-    this.lastReceivedCommentaryId = null;
-    this.commentaryStartEvent = null;
-  }
-
   prepareRun() {
     // teleport to spawn, freeze, reset props and state
-    this.ownBuffer = [];
-    for (const ghost of this.ghosts.values()) ghost.buffer = [];
+    this.clearOwnSnapshots();
     this.finished = false;
     this.running = false;
     this.timer = 0;
@@ -1217,21 +1085,23 @@ export class Game {
     this.delivered = false;
     this.denyCooldown = 0;
     this.moverT = 0;
+    this.simulationClock.reset();
     this.squadMix = makeSquadMixState();
-    this.resetCommentary(true);
+    this.commentaryRun += 1;
+    this.commentary.reset(`${this.teamId}:${this.level.id}:${this.commentaryRun}`);
     for (const f of this.checkpointMeshes) (f.material as THREE.MeshStandardMaterial).color.set("#ffd23f");
-    if (this.isHost) {
-      for (const m of this.movers) {
-        m.rb.setTranslation({ x: m.base.x, y: m.base.y, z: m.base.z }, true);
+    for (const m of this.movers) {
+      const initialOffset = Math.sin(m.phase) * m.dist;
+      const x = m.base.x + (m.axis === "x" ? initialOffset : 0);
+      const z = m.base.z + (m.axis === "z" ? initialOffset : 0);
+      m.mesh.position.set(x, m.base.y, z);
+      if (this.isHost) {
+        m.rb.setTranslation({ x, y: m.base.y, z }, true);
         m.rb.setLinvel({ x: 0, y: 0, z: 0 }, true);
-        m.mesh.position.copy(m.base);
       }
-    } else {
-      for (const m of this.movers) m.mesh.position.copy(m.base);
     }
     if (this.isHost && this.body) {
       this.body.teleport(new THREE.Vector3(...this.level.spawn), this.level.spawnYaw);
-      this.reactor?.resetClock(true);
       for (const p of this.props) this.resetProp(p);
       this.body.frozen = true;
     }
@@ -1242,16 +1112,14 @@ export class Game {
     this.frozen = false;
     if (this.body) this.body.frozen = false;
     this.running = true;
-    this.commentaryStartEvent = this.commentaryRunCount > 0 ? "retry" : "start";
-    this.commentaryRunCount++;
     this.timer = 0;
+    this.commentOnObjective({ type: "start" });
     this.emitHud();
   }
   freeRoam() {
     this.frozen = false;
     this.running = false;
     this.finished = false;
-    this.resetCommentary(true);
     if (this.body) this.body.frozen = false;
     this.emitHud();
   }
@@ -1269,29 +1137,19 @@ export class Game {
     p.cooldown = 0.5;
   }
 
-  private scheduleTimeout(fn: () => void, delay: number) {
-    const handle = setTimeout(() => {
-      this.scheduledTimeouts.delete(handle);
-      if (!this.disposed) fn();
-    }, delay);
-    this.scheduledTimeouts.add(handle);
-    return handle;
-  }
-
-  private cancelScheduledTimeouts() {
-    for (const handle of this.scheduledTimeouts) clearTimeout(handle);
-    this.scheduledTimeouts.clear();
-  }
-
   /* ------------------------------- Loop ------------------------------- */
   start() {
     this.lastFrame = performance.now();
     const loop = (now: number) => {
       if (this.disposed) return;
       this.raf = requestAnimationFrame(loop);
+      if (document.visibilityState === "hidden") {
+        this.lastFrame = now;
+        return;
+      }
       let dt = (now - this.lastFrame) / 1000;
       this.lastFrame = now;
-      dt = Math.min(dt, 0.1);
+      if (!Number.isFinite(dt) || dt < 0) dt = 0;
       this.frame(dt);
     };
     this.raf = requestAnimationFrame(loop);
@@ -1299,15 +1157,15 @@ export class Game {
 
   private frame(dt: number) {
     if (this.isHost && this.body) {
-      // Resolve assigned role controls into the authoritative body channels.
-      // Expired remote leases become neutral before mixing.
-      const merged: Partial<Record<Role, RoleInput>> = { ...this.remoteInputBuffer.getMerged(), ...this.localInputs };
-      const phys = resolvePhysInputs(merged, this.squadSize, Math.min(dt, 0.1), this.squadMix);
-      const reactorFrame = this.reactor?.advance(dt, phys, {
-        beforeStep: ({ dt: stepDt }) => this.beforePhysicsStep(stepDt),
-        afterStep: ({ dt: stepDt }, stepResult) => this.afterPhysicsStep(stepDt, stepResult, merged, phys),
-      });
-      this.physicsDiagnostics = reactorFrame?.diagnostics ?? null;
+      // merge squad inputs (3P/5P) into the 5 physics channels
+      const merged: Partial<Record<Role, RoleInput>> = { ...this.remoteInputs, ...this.localInputs };
+      this.commentaryInputs = merged;
+      const steps = this.simulationClock.advance(dt);
+      for (let step = 0; step < steps; step++) {
+        const phys = resolvePhysInputs(merged, this.squadSize, this.fixedDt, this.squadMix);
+        Object.assign(this.body.inputs, phys);
+        this.stepPhysics(this.fixedDt);
+      }
       this.body.writeTransforms(this.displayTransforms);
       this.displayYaw = this.body.heading;
       this.displayPitch = this.body.headPitch;
@@ -1325,11 +1183,10 @@ export class Game {
         m.mesh.position.set(t.x, t.y, t.z);
       }
       this.sendAcc += dt;
-      if (this.sendAcc >= 1 / 15) {
-        this.sendAcc = 0;
-        this.onSnapshot?.(this.buildSnapshot());
-        this.pendingEvents = [];
-        this.pendingMsg = undefined;
+      if (this.sendAcc >= SNAPSHOT_SEND_INTERVAL_SECONDS) {
+        this.sendAcc %= SNAPSHOT_SEND_INTERVAL_SECONDS;
+        const snapshot = this.takeSnapshot();
+        this.onSnapshot?.(snapshot);
       }
     } else {
       this.applyInterpolated(this.ownBuffer, this.displayTransforms, true);
@@ -1346,7 +1203,7 @@ export class Game {
     this.view.setFace(dt, this.displayYaw, this.displayPitch, this.pelvisYawFromDisplay(), this.displayFallen, this.displayHolding > 0);
     // ghosts
     for (const g of this.ghosts.values()) {
-      const arr = g.transforms;
+      const arr: number[] = new Array(PART_COUNT * 7);
       const ok = this.applyInterpolated(g.buffer, arr, false);
       g.view.root.visible = ok;
       if (ok) {
@@ -1359,15 +1216,10 @@ export class Game {
     this.particles.update(dt);
     // deco animation
     const t = performance.now() / 1000;
-    if (this.waterMat) this.waterMat.uniforms.time.value = t;
     if (this.deliverPad) (this.deliverPad.material as THREE.MeshStandardMaterial).emissiveIntensity = 0.6 + Math.sin(t * 4) * 0.4;
     for (const f of this.checkpointMeshes) f.rotation.y = Math.sin(t * 3 + f.userData.idx) * 0.2;
     this.sun.position.copy(this.camFocus).add(new THREE.Vector3(18, 32, 14));
     this.sun.target.position.copy(this.camFocus);
-    if (this.skyMat) {
-      tmpV.copy(this.sun.position).sub(this.camFocus).normalize();
-      this.skyMat.uniforms.sunDir.value.copy(tmpV);
-    }
     this.hudAcc += dt;
     if (this.hudAcc > 0.1) {
       this.hudAcc = 0;
@@ -1382,10 +1234,10 @@ export class Game {
     return Math.atan2(-tmpV.x, -tmpV.z);
   }
 
-  private beforePhysicsStep(dt: number) {
-    // Kinematic movers (ferries / timing gates) are velocity-based so riders
-    // receive a real contact impulse from Rapier.
-    if (this.movers.length > 0) {
+  private stepPhysics(dt: number) {
+    const body = this.body!;
+    // kinematic movers (ferries / timing gates) — ponytail: velocity-based so riders get carried
+    if (this.movers.length > 0 && !this.frozen) {
       this.moverT += dt;
       for (const m of this.movers) {
         const off = Math.sin(this.moverT * m.speed + m.phase) * m.dist;
@@ -1395,97 +1247,46 @@ export class Game {
         m.rb.setLinvel({ x: (nx - cur.x) / dt, y: 0, z: (nz - cur.z) / dt }, true);
       }
     }
+    body.update(dt);
+    // props cooldown
     for (const p of this.props) p.cooldown = Math.max(0, p.cooldown - dt);
     this.denyCooldown = Math.max(0, this.denyCooldown - dt);
-  }
-
-  private afterPhysicsStep(
-    dt: number,
-    result: ReactorStepResult,
-    roleInputs: Partial<Record<Role, RoleInput>>,
-    inputs: BodyInputs,
-  ) {
-    const eventStart = this.pendingEvents.length;
+    this.world.step(this.eventQueue);
     if (this.running && !this.finished) this.timer += dt;
-    for (const ev of result.bodyEvents) this.handleBodyEvent(ev, true);
-    for (const event of result.contactForceEvents) this.handleContactForceEvent(event);
-    this.checkObjectives();
-    this.updateCommentary(result, roleInputs, inputs, this.pendingEvents.slice(eventStart));
-  }
-
-  private updateCommentary(
-    result: ReactorStepResult,
-    roleInputs: Partial<Record<Role, RoleInput>>,
-    inputs: BodyInputs,
-    events: Snap["ev"],
-  ) {
-    if (!this.running && !this.finished && !this.commentaryStartEvent) return;
-    if (this.finished && !events.some((event) => event.type === "finish")) {
-      if (result.tick > this.commentaryBroadcastUntilTick) this.activeCommentary = null;
-      return;
-    }
-    const observedEvents: CommentaryEvent[] = [];
-    if (this.commentaryStartEvent) {
-      observedEvents.push({ type: this.commentaryStartEvent });
-      this.commentaryStartEvent = null;
-    }
-    for (const event of events) {
-      if (isBodyEvent(event)) {
-        observedEvents.push({ type: event.type, reason: event.reason, hand: event.hand, propId: event.propId });
-      } else if (COMMENTARY_LEVEL_EVENTS.has(event.type)) {
-        observedEvents.push({
-          type: event.type as "checkpoint" | "score" | "finish" | "splash" | "crack",
-          source: event.source,
-          propId: event.propId,
-        });
+    const commentaryFrame = this.makeCommentaryFrame();
+    if (commentaryFrame) this.emitCommentary(this.commentary.update(commentaryFrame));
+    // body events
+    for (const ev of body.events) this.handleBodyEvent(ev, true);
+    // contact force events
+    this.eventQueue.drainContactForceEvents((ev) => {
+      const h1 = ev.collider1();
+      const h2 = ev.collider2();
+      const f = ev.totalForceMagnitude();
+      const c1 = this.world.getCollider(h1);
+      const c2 = this.world.getCollider(h2);
+      if (!c1 || !c2) return;
+      const bodyPart = body.colliderHandles.has(h1) || body.colliderHandles.has(h2);
+      const prop = this.props.find((p) => p.colliderHandle === h1 || p.colliderHandle === h2);
+      const other = body.colliderHandles.has(h1) ? c2 : c1;
+      const t = other.translation();
+      const pos: [number, number, number] = bodyPart ? (() => {
+        const bc = body.colliderHandles.has(h1) ? c1 : c2;
+        const bt = bc.translation();
+        return [bt.x, bt.y, bt.z];
+      })() : [t.x, t.y, t.z];
+      if (prop?.def.fragile && f > (this.level.fragileForce ?? 900) && prop.cooldown <= 0) {
+        const heldByUs = body.isHolding(prop.id) && bodyPart;
+        if (!heldByUs) {
+          this.breakProp(prop);
+          return;
+        }
       }
-    }
-    const cue = this.commentary.step({
-      tick: result.tick,
-      challengeId: this.level.id,
-      diagnostics: { ...result.diagnostics, hanging: this.body?.holds.some((hold) => hold.isStatic) ?? false },
-      events: observedEvents,
-      inputs,
-      roleInputs,
-      objective: {
-        running: this.running,
-        finished: this.finished,
-        checkpoint: this.checkpointIdx,
-        score: this.score,
-        scoreTarget: this.level.targetScore ?? 0,
-      },
+      if (bodyPart && f > 500) this.handleLevelEvent({ type: "thud", pos, force: Math.min(1, f / 1500) }, true);
+      else if (prop && f > 250) this.handleLevelEvent({ type: "bounce", pos, force: Math.min(1, f / 1200) }, true);
     });
-    if (result.tick > this.commentaryBroadcastUntilTick) this.activeCommentary = null;
-    if (!cue) return;
-    this.activeCommentary = cue;
-    this.commentaryBroadcastUntilTick = cue.tick + COMMENTARY_BROADCAST_TICKS;
-    this.onEvent({ type: "commentary", cue });
-  }
-
-  private handleContactForceEvent(ev: ReactorContactForceEvent) {
-    const body = this.body;
-    if (!body) return;
-    const h1 = ev.collider1;
-    const h2 = ev.collider2;
-    const f = ev.totalForceMagnitude;
-    const c1 = this.world.getCollider(h1);
-    const c2 = this.world.getCollider(h2);
-    if (!c1 || !c2) return;
-    const bodyPart = ev.involvesBody;
-    const prop = this.props.find((p) => p.colliderHandle === h1 || p.colliderHandle === h2);
-    const fallback = (body.colliderHandles.has(h1) ? c1 : body.colliderHandles.has(h2) ? c2 : prop?.colliderHandle === h1 ? c1 : c2).translation();
-    const pos: [number, number, number] = ev.position
-      ? [ev.position[0], ev.position[1], ev.position[2]]
-      : [fallback.x, fallback.y, fallback.z];
-    if (prop?.def.fragile && f > (this.level.fragileForce ?? 900) && prop.cooldown <= 0) {
-      const heldByUs = body.isHolding(prop.id) && bodyPart;
-      if (!heldByUs) {
-        this.breakProp(prop);
-        return;
-      }
-    }
-    if (bodyPart && f > 500) this.handleLevelEvent({ type: "thud", pos, force: Math.min(1, f / 1500) }, true);
-    else if (prop && f > 250) this.handleLevelEvent({ type: "bounce", pos, force: Math.min(1, f / 1200) }, true);
+    this.eventQueue.drainCollisionEvents(() => {});
+    // objectives
+    this.checkObjectives();
   }
 
   private breakProp(p: Prop) {
@@ -1493,6 +1294,7 @@ export class Game {
     this.handleLevelEvent({ type: "crack", pos: [t.x, t.y, t.z] }, true);
     if (this.body) for (const h of [...this.body.holds]) if (h.id === p.id) this.body.releaseAll(true);
     this.resetProp(p);
+    this.commentOnObjective({ type: "crack", subject: "egg" });
   }
 
   private checkObjectives() {
@@ -1503,17 +1305,21 @@ export class Game {
     if (pp.y < L.killY) {
       const cp = L.checkpoints[this.checkpointIdx];
       const spawn = cp?.spawn ? new THREE.Vector3(...cp.spawn) : new THREE.Vector3(...L.spawn);
-      this.handleLevelEvent({ type: "splash", pos: [pp.x, -3, pp.z], source: "body" }, true);
+      this.handleLevelEvent({ type: "splash", pos: [pp.x, -3, pp.z] }, true);
       body.teleport(spawn, L.spawnYaw);
-      this.reactor?.resetClock();
+      this.commentOnObjective({ type: "splash", subject: "player" });
     }
     for (const p of this.props) {
       if (!p.body) continue;
       const t = p.body.translation();
       if (t.y < L.killY) {
-        this.handleLevelEvent({ type: "splash", pos: [t.x, -3, t.z], source: "prop", propId: p.id }, true);
+        this.handleLevelEvent({ type: "splash", pos: [t.x, -3, t.z] }, true);
         if (body.isHolding(p.id)) body.releaseAll(true);
         this.resetProp(p);
+        if (p.def.deliverable) {
+          const subject = L.id === "egg-express" ? "egg" : L.id === "summit-sync" ? "core" : "cargo";
+          this.commentOnObjective({ type: "splash", subject });
+        }
       }
     }
     if (!this.running || this.finished) return;
@@ -1523,6 +1329,7 @@ export class Game {
         this.checkpointIdx = i;
         (this.checkpointMeshes[i].material as THREE.MeshStandardMaterial).color.set("#6ef29a");
         this.handleLevelEvent({ type: "checkpoint", pos: [pp.x, pp.y, pp.z] }, true);
+        this.commentOnObjective({ type: "checkpoint", value: i });
       }
     });
     if (L.deliver) {
@@ -1533,8 +1340,9 @@ export class Game {
         if (inZone(tmpV2.set(t.x, t.y, t.z), L.deliver) && !body.isHolding(p.id) && Math.hypot(v.x, v.y, v.z) < 0.8) {
           if (L.requireDeliverThenFinish && L.finish) {
             if (!this.delivered) {
-                this.delivered = true;
-                this.handleLevelEvent({ type: "score", pos: [t.x, t.y, t.z] }, true);
+              this.delivered = true;
+              this.handleLevelEvent({ type: "score", pos: [t.x, t.y, t.z] }, true);
+              this.commentOnObjective({ type: "delivery", subject: "core" });
             }
           } else this.finish();
         }
@@ -1566,8 +1374,9 @@ export class Game {
         if (v.y < -0.5 && inZone(tmpV2.set(t.x, t.y, t.z), L.hoop.zone)) {
           this.score++;
           this.handleLevelEvent({ type: "score", pos: [t.x, t.y, t.z] }, true);
+          this.commentOnObjective({ type: "score", value: this.score, target: L.targetScore });
           p.cooldown = 1.5;
-          this.scheduleTimeout(() => this.resetProp(p), 900);
+          this.scheduleEffect(() => this.resetProp(p), 900);
           if (this.score >= (L.targetScore ?? 3)) this.finish();
         }
       }
@@ -1578,8 +1387,13 @@ export class Game {
     if (this.finished) return;
     this.finished = true;
     this.running = false;
+    // Capture the exact completion pose before the finish reducer is sent. The
+    // server uses the resulting host snapshot as a lightweight objective proof.
+    this.body?.writeTransforms(this.displayTransforms);
+    this.displayFallen = this.body?.fallen ?? this.displayFallen;
     const pp = this.body!.pelvisPos(new THREE.Vector3());
     this.handleLevelEvent({ type: "finish", pos: [pp.x, pp.y + 1, pp.z] }, true);
+    this.commentOnObjective({ type: "finish" });
     this.onEvent({ type: "finish", timeMs: Math.round(this.timer * 1000) });
     this.emitHud();
   }
@@ -1587,6 +1401,43 @@ export class Game {
   private message(text: string, tone: "good" | "bad" | "info" = "info") {
     this.onEvent({ type: "message", text, tone });
     this.pendingMsg = `${tone}|${text}`;
+  }
+
+  private makeCommentaryFrame(): CommentaryFrame | null {
+    const body = this.body;
+    if (!body) return null;
+    const rotation = body.quat(PELVIS, tmpQ);
+    const localUp = tmpV2.set(0, 1, 0).applyQuaternion(rotation);
+    const velocity = body.parts[PELVIS].linvel();
+    return {
+      timeMs: Math.round(this.timer * 1000),
+      challengeId: this.level.id as CommentaryChallengeId,
+      running: this.running,
+      finished: this.finished,
+      squadSize: this.squadSize,
+      inputs: this.commentaryInputs,
+      pelvisTilt: Math.acos(THREE.MathUtils.clamp(localUp.y, -1, 1)),
+      grounded: body.grounded,
+      fallen: body.fallen,
+      hanging: body.holds.some((hold) => hold.isStatic),
+      holding: body.holds.length,
+      verticalSpeed: velocity.y,
+      horizontalSpeed: body.speed,
+      brace: body.brace,
+      crouch: body.crouch > 0.5,
+      checkpoint: this.checkpointIdx,
+      score: this.score,
+      delivery: this.delivered,
+    };
+  }
+
+  private emitCommentary(line: CommentaryLine | null) {
+    if (line) this.message(line.text, line.tone);
+  }
+
+  private commentOnObjective(event: CommentaryObjectiveEvent) {
+    const frame = this.makeCommentaryFrame();
+    if (frame) this.emitCommentary(this.commentary.onObjectiveEvent(event, frame));
   }
 
   /* ------------------------------- Events / FX ------------------------------- */
@@ -1610,16 +1461,6 @@ export class Game {
       case "release":
         a.release();
         break;
-      case "slip":
-        a.release();
-        this.particles.emit(p, 7, { color: ["#ffd23f", "#ffffff"], speed: 1.1, up: 0.5, size: 0.05, life: 0.35 });
-        this.shake = Math.max(this.shake, 0.08);
-        break;
-      case "drop":
-        a.fall();
-        this.particles.emit(p, 10, { color: ["#ff9a3c", "#ffffff"], speed: 1.5, up: 0.8, size: 0.06, life: 0.45 });
-        this.view.shout("WHOOPS");
-        break;
       case "throw":
         a.whoosh();
         this.particles.emit(p, 10, { color: ["#ffffff", "#ffe08a"], speed: 2.5, up: 1, size: 0.06, life: 0.4 });
@@ -1628,7 +1469,6 @@ export class Game {
         a.fall();
         this.particles.emit(p, 16, { color: ["#e8dcc5", "#cfc3a8"], speed: 2.5, up: 1.6, size: 0.08, life: 0.6, spread: 0.6 });
         this.shake = Math.max(this.shake, 0.5);
-        this.view.shout(["TACTICAL NAP", "WHEEEE", "I'M FINE"][Math.floor(Math.random() * 3)]);
         break;
       case "getup":
         a.getup();
@@ -1645,28 +1485,32 @@ export class Game {
         a.climb();
         break;
       case "shout": {
-        a.quack();
-        this.particles.emit(p, 9, { color: ["#ff9a3c", "#ffd23f", "#ffffff"], speed: 1.4, up: 1.5, size: 0.055, life: 0.42, spread: 0.22 });
-        this.shake = Math.max(this.shake, 0.07);
-        const words = ["QUACK!", "WAAK!", "HONK??", "GO GO GO", "GRAB IT!", "OTHER LEFT!", "BONK MODE", "why", "TOGETHER-ISH!"];
+        a.shout();
+        const words = ["LEFT!", "RIGHT!", "NO NO NO", "LEG!!", "GRAB IT!", "WAIT!", "GO GO GO", "LEAN!", "OTHER LEFT!", "AAAH", "CROUCH!", "JUMP!!", "why", "STOP!", "TOGETHER!"];
         this.view.shout(words[Math.floor(Math.random() * words.length)]);
         break;
       }
     }
     if (local) {
+      const frame = this.makeCommentaryFrame();
+      if (frame) {
+        this.emitCommentary(this.commentary.onBodyEvent({
+          type: ev.type,
+          hand: ev.hand === 0 || ev.hand === 1 ? ev.hand : undefined,
+          propId: ev.propId,
+        }, frame));
+      }
       this.pendingEvents.push(ev);
-      this.onBodyEvent?.(ev);
     }
   }
 
-  handleLevelEvent(ev: LevelEvent, local: boolean) {
+  handleLevelEvent(ev: { type: string; pos: [number, number, number]; force?: number }, local: boolean) {
     const a = this.audio;
     switch (ev.type) {
       case "thud":
         a.thud(ev.force ?? 0.5);
         this.particles.emit(ev.pos, 6, { color: ["#e8dcc5", "#ffffff"], speed: 1.5, up: 1, size: 0.06, life: 0.4 });
         this.shake = Math.max(this.shake, 0.15 * (ev.force ?? 0.5));
-        if ((ev.force ?? 0) > 0.78) this.view.shout("BONK!");
         break;
       case "bounce":
         a.thud((ev.force ?? 0.5) * 0.5);
@@ -1692,52 +1536,40 @@ export class Game {
       case "finish":
         a.fanfare();
         for (let i = 0; i < 6; i++)
-          this.scheduleTimeout(() => this.particles.emit([ev.pos[0] + (Math.random() - 0.5) * 3, ev.pos[1] + 1.5, ev.pos[2] + (Math.random() - 0.5) * 3], 50, { color: ["#ff5d5d", "#4fa8ff", "#ffd23f", "#6ef29a", "#c58bff", "#ffffff"], speed: 3.5, up: 5, size: 0.1, life: 2.2, spread: 0.5 }), i * 180);
+          this.scheduleEffect(() => this.particles.emit([ev.pos[0] + (Math.random() - 0.5) * 3, ev.pos[1] + 1.5, ev.pos[2] + (Math.random() - 0.5) * 3], 50, { color: ["#ff5d5d", "#4fa8ff", "#ffd23f", "#6ef29a", "#c58bff", "#ffffff"], speed: 3.5, up: 5, size: 0.1, life: 2.2, spread: 0.5 }), i * 180);
         break;
     }
-    if (local) this.pendingEvents.push(ev);
+    if (local) {
+      if (ev.type === "thud" || ev.type === "bounce") {
+        this.commentOnObjective({ type: ev.type, force: ev.force });
+      }
+      this.pendingEvents.push(ev);
+    }
   }
 
   /* ------------------------------- Networking ------------------------------- */
   buildSnapshot(): Snap {
     const props: number[] = [];
-    const propMotion: number[] = [];
+    const propVelocities: number[] = [];
     for (const p of this.props) {
       if (!p.body) continue;
       const t = p.body.translation();
       const r = p.body.rotation();
+      const linear = p.body.linvel();
+      const angular = p.body.angvel();
       props.push(p.id, r3(t.x), r3(t.y), r3(t.z), r3(r.x), r3(r.y), r3(r.z), r3(r.w));
-      const v = p.body.linvel();
-      const av = p.body.angvel();
-      propMotion.push(p.id, r3(v.x), r3(v.y), r3(v.z), r3(av.x), r3(av.y), r3(av.z));
+      propVelocities.push(p.id, rv(linear.x), rv(linear.y), rv(linear.z), rv(angular.x), rv(angular.y), rv(angular.z));
     }
-    const v: number[] = [];
-    const av: number[] = [];
-    if (this.body) {
-      for (const part of this.body.parts) {
-        const lv = part.linvel();
-        const angular = part.angvel();
-        v.push(r3(lv.x), r3(lv.y), r3(lv.z));
-        av.push(r3(angular.x), r3(angular.y), r3(angular.z));
-      }
+    const bodyVelocities: number[] = [];
+    for (const part of this.body?.parts ?? []) {
+      const linear = part.linvel();
+      const angular = part.angvel();
+      bodyVelocities.push(rv(linear.x), rv(linear.y), rv(linear.z), rv(angular.x), rv(angular.y), rv(angular.z));
     }
-    const commentaryState = this.commentary.capture();
-    const commentaryTick = this.reactor?.currentTick ?? commentaryState.lastTick;
-    const commentary = this.activeCommentary && commentaryTick <= this.commentaryBroadcastUntilTick
-      ? this.activeCommentary
-      : undefined;
     return {
       t: performance.now(),
       p: this.displayTransforms.map(r3),
-      v,
-      av,
       props,
-      propMotion,
-      moverT: this.moverT,
-      checkpointIdx: this.checkpointIdx,
-      delivered: this.delivered,
-      running: this.running,
-      finished: this.finished,
       yaw: this.displayYaw,
       pitch: this.displayPitch,
       timer: this.timer,
@@ -1745,18 +1577,30 @@ export class Game {
       score: this.score,
       ev: this.pendingEvents,
       msg: this.pendingMsg,
-      commentary,
-      commentaryState,
-      // Body transforms/velocities already live in p/v/av. Keep only the
-      // compact controller/grip continuation state on the 15 Hz wire path.
-      reactor: this.reactor?.capture(false),
+      state: {
+        checkpoint: this.checkpointIdx,
+        delivered: this.delivered,
+        moverTime: this.moverT,
+        running: this.running,
+        finished: this.finished,
+        frozen: this.frozen,
+        holds: this.body?.holds.map((hold) => ({ hand: hold.hand, propId: hold.id })) ?? [],
+        ...(bodyVelocities.length === PART_COUNT * 6 ? { bodyVelocities } : {}),
+        ...(propVelocities.length > 0 ? { propVelocities } : {}),
+      },
     };
   }
 
+  /** Build a network snapshot and consume its one-shot effects/message. */
+  takeSnapshot(): Snap {
+    const snapshot = this.buildSnapshot();
+    this.pendingEvents = [];
+    this.pendingMsg = undefined;
+    return snapshot;
+  }
+
   /** Snapshot from own team's host (when this client is not the host). */
-  applyOwnSnapshot(raw: Snap) {
-    const s = validateSnapshot(raw);
-    if (!s) return false;
+  applyOwnSnapshot(s: Snap) {
     const now = performance.now();
     this.ownBuffer.push({ recv: now, snap: s });
     while (this.ownBuffer.length > 12) this.ownBuffer.shift();
@@ -1765,18 +1609,7 @@ export class Game {
     this.displayYaw = s.yaw;
     this.displayPitch = s.pitch;
     this.displayFallen = s.fallen === 1;
-    this.displayHolding = s.reactor?.grips.length ?? 0;
-    if (Number.isFinite(s.moverT)) {
-      this.moverT = s.moverT!;
-      for (const mover of this.movers) {
-        const offset = Math.sin(this.moverT * mover.speed + mover.phase) * mover.dist;
-        mover.mesh.position.set(
-          mover.base.x + (mover.axis === "x" ? offset : 0),
-          mover.base.y,
-          mover.base.z + (mover.axis === "z" ? offset : 0),
-        );
-      }
-    }
+    if (s.state) this.restoreObjectiveState(s.state);
     for (const ev of s.ev) {
       if (isBodyEvent(ev)) this.handleBodyEvent(ev, false);
       else this.handleLevelEvent(ev, false);
@@ -1785,27 +1618,20 @@ export class Game {
       const [tone, ...rest] = s.msg.split("|");
       this.onEvent({ type: "message", text: rest.join("|"), tone: tone as "good" | "bad" | "info" });
     }
-    if (s.commentary && s.commentary.id !== this.lastReceivedCommentaryId) {
-      this.lastReceivedCommentaryId = s.commentary.id;
-      this.onEvent({ type: "commentary", cue: s.commentary });
-    }
-    return true;
   }
 
-  applyGhostSnapshot(teamId: number, color: string, name: string, raw: Snap) {
-    const s = validateSnapshot(raw);
-    if (!s) return false;
+  applyGhostSnapshot(teamId: number, color: string, name: string, s: Snap) {
     let g = this.ghosts.get(teamId);
     if (!g) {
       const view = new BodyView(color, true, name);
       this.scene.add(view.root);
-      g = { view, buffer: [], transforms: new Array(PART_COUNT * 7).fill(0), lastEvT: 0 };
+      g = { view, buffer: [], lastEvT: 0 };
       this.ghosts.set(teamId, g);
     }
+    g.view.setTeamName(name, color);
     g.buffer.push({ recv: performance.now(), snap: s });
     while (g.buffer.length > 12) g.buffer.shift();
     for (const ev of s.ev) if (ev.type === "shout") g.view.shout(["HEY!", "MOVE!", "LOL", "NOOO", "FASTER!"][Math.floor(Math.random() * 5)]);
-    return true;
   }
 
   removeGhost(teamId: number) {
@@ -1816,19 +1642,11 @@ export class Game {
     this.ghosts.delete(teamId);
   }
 
-  /** Prevent interpolation across two different host authority epochs. */
-  clearSnapshotBuffer(teamId: number) {
-    if (teamId === this.teamId) this.ownBuffer = [];
-    const ghost = this.ghosts.get(teamId);
-    if (ghost) ghost.buffer = [];
-  }
-
   private applyInterpolated(buffer: { recv: number; snap: Snap }[], out: number[], withProps: boolean): boolean {
     if (buffer.length === 0) return false;
-    const rt = performance.now() - GUEST_INTERPOLATION_DELAY_MS;
+    const rt = performance.now() - SNAPSHOT_INTERPOLATION_DELAY_MS;
     let a = buffer[0];
     let b = buffer[buffer.length - 1];
-    let extrapolating = false;
     for (let i = 0; i < buffer.length - 1; i++) {
       if (buffer[i].recv <= rt && buffer[i + 1].recv >= rt) {
         a = buffer[i];
@@ -1836,23 +1654,11 @@ export class Game {
         break;
       }
     }
-    if (rt > b.recv) {
-      const latest = buffer.length - 1;
-      if (latest > 0) {
-        a = buffer[latest - 1];
-        b = buffer[latest];
-        extrapolating = true;
-      } else {
-        a = b;
-      }
-    }
+    if (rt > b.recv) a = b;
     const span = b.recv - a.recv;
-    // Briefly project the last measured motion when delivery jitters. Large
-    // pelvis jumps are teleports/checkpoints and intentionally snap instead.
-    const pelvisStep = Math.hypot(b.snap.p[0] - a.snap.p[0], b.snap.p[1] - a.snap.p[1], b.snap.p[2] - a.snap.p[2]);
-    const maxK = extrapolating && pelvisStep < 2.5 ? 1 + GUEST_MAX_EXTRAPOLATION_MS / Math.max(span, 1) : 1;
-    const k = span > 0 ? THREE.MathUtils.clamp((rt - a.recv) / span, 0, maxK) : 1;
-    const rotationK = extrapolating ? Math.min(k, 1.5) : k;
+    const k = span > 0 ? THREE.MathUtils.clamp((rt - a.recv) / span, 0, 1) : 1;
+    const predictionSeconds = snapshotExtrapolationSeconds(rt, b.recv);
+    const bodyVelocities = predictionSeconds > 0 ? b.snap.state?.bodyVelocities : undefined;
     for (let i = 0; i < PART_COUNT; i++) {
       const o = i * 7;
       out[o] = THREE.MathUtils.lerp(a.snap.p[o], b.snap.p[o], k);
@@ -1860,11 +1666,32 @@ export class Game {
       out[o + 2] = THREE.MathUtils.lerp(a.snap.p[o + 2], b.snap.p[o + 2], k);
       tmpQ.set(a.snap.p[o + 3], a.snap.p[o + 4], a.snap.p[o + 5], a.snap.p[o + 6]);
       tmpQ2.set(b.snap.p[o + 3], b.snap.p[o + 4], b.snap.p[o + 5], b.snap.p[o + 6]);
-      tmpQ.slerp(tmpQ2, rotationK);
+      tmpQ.slerp(tmpQ2, k);
       out[o + 3] = tmpQ.x;
       out[o + 4] = tmpQ.y;
       out[o + 5] = tmpQ.z;
       out[o + 6] = tmpQ.w;
+      if (bodyVelocities?.length === PART_COUNT * 6) {
+        const velocityOffset = i * 6;
+        out[o] += bodyVelocities[velocityOffset] * predictionSeconds;
+        out[o + 1] += bodyVelocities[velocityOffset + 1] * predictionSeconds;
+        out[o + 2] += bodyVelocities[velocityOffset + 2] * predictionSeconds;
+        tmpV.set(
+          bodyVelocities[velocityOffset + 3],
+          bodyVelocities[velocityOffset + 4],
+          bodyVelocities[velocityOffset + 5],
+        );
+        const angularSpeed = tmpV.length();
+        if (angularSpeed > 1e-6) {
+          tmpQ.set(out[o + 3], out[o + 4], out[o + 5], out[o + 6]);
+          tmpQ2.setFromAxisAngle(tmpV.multiplyScalar(1 / angularSpeed), angularSpeed * predictionSeconds);
+          tmpQ.premultiply(tmpQ2).normalize();
+          out[o + 3] = tmpQ.x;
+          out[o + 4] = tmpQ.y;
+          out[o + 5] = tmpQ.z;
+          out[o + 6] = tmpQ.w;
+        }
+      }
     }
     if (withProps) {
       const pa = a.snap.props;
@@ -1878,10 +1705,25 @@ export class Game {
           prop.mesh.position.set(THREE.MathUtils.lerp(pa[j + 1], pb[i + 1], k), THREE.MathUtils.lerp(pa[j + 2], pb[i + 2], k), THREE.MathUtils.lerp(pa[j + 3], pb[i + 3], k));
           tmpQ.set(pa[j + 4], pa[j + 5], pa[j + 6], pa[j + 7]);
           tmpQ2.set(pb[i + 4], pb[i + 5], pb[i + 6], pb[i + 7]);
-          prop.mesh.quaternion.copy(tmpQ.slerp(tmpQ2, rotationK));
+          prop.mesh.quaternion.copy(tmpQ.slerp(tmpQ2, k));
         } else {
           prop.mesh.position.set(pb[i + 1], pb[i + 2], pb[i + 3]);
           prop.mesh.quaternion.set(pb[i + 4], pb[i + 5], pb[i + 6], pb[i + 7]);
+        }
+        if (predictionSeconds > 0) {
+          const velocities = b.snap.state?.propVelocities;
+          const velocityOffset = velocities?.findIndex((value, index) => index % 7 === 0 && value === id) ?? -1;
+          if (velocities && velocityOffset >= 0) {
+            prop.mesh.position.x += velocities[velocityOffset + 1] * predictionSeconds;
+            prop.mesh.position.y += velocities[velocityOffset + 2] * predictionSeconds;
+            prop.mesh.position.z += velocities[velocityOffset + 3] * predictionSeconds;
+            tmpV.set(velocities[velocityOffset + 4], velocities[velocityOffset + 5], velocities[velocityOffset + 6]);
+            const angularSpeed = tmpV.length();
+            if (angularSpeed > 1e-6) {
+              tmpQ.setFromAxisAngle(tmpV.multiplyScalar(1 / angularSpeed), angularSpeed * predictionSeconds);
+              prop.mesh.quaternion.premultiply(tmpQ).normalize();
+            }
+          }
         }
       }
     }
@@ -1912,162 +1754,69 @@ export class Game {
     const look = tmpV2.copy(this.camFocus).add(tmpV.set(-Math.sin(this.camYaw), 0, -Math.cos(this.camYaw)).multiplyScalar(1.2));
     look.y += 0.2 - this.displayPitch * 0.8;
     this.camera.lookAt(look);
-    // A restrained speed/fall lens change adds weight while preserving the clear
-    // third-person read needed for cooperative physics.
-    const targetFov = this.displayFallen ? 62 : this.running ? 60 : 58;
-    const nextFov = THREE.MathUtils.lerp(this.camera.fov, targetFov, 1 - Math.exp(-dt * 4));
-    if (Math.abs(nextFov - this.camera.fov) > 0.01) {
-      this.camera.fov = nextFov;
-      this.camera.updateProjectionMatrix();
-    }
   }
 
   /* ------------------------------- HUD ------------------------------- */
   private emitHud() {
-    const remoteReactor = this.ownBuffer[this.ownBuffer.length - 1]?.snap.reactor;
-    const remoteController = remoteReactor?.controller;
-    const localGripStress = this.physicsDiagnostics?.gripStress;
-    const remoteGripStress = remoteController?.gripStress;
-    const gripStress = localGripStress
-      ? Math.max(localGripStress[0], localGripStress[1])
-      : remoteGripStress
-        ? Math.max(remoteGripStress[0], remoteGripStress[1])
-        : 0;
-    const supportFeet = this.physicsDiagnostics?.supportContacts
-      ?? remoteController?.supportFeet?.filter(Boolean).length
-      ?? 0;
     this.onEvent({
       type: "hud",
       hud: {
         timer: this.timer,
         fallen: this.displayFallen,
-        holding: this.body ? this.body.holds.length : remoteReactor?.grips.length ?? this.displayHolding,
+        holding: this.displayHolding,
         score: this.score,
         scoreTarget: this.level.targetScore ?? 0,
-        crouch: this.body ? this.body.crouch > 0.5 : (remoteController?.crouch ?? 0) > 0.5,
-        brace: this.body ? this.body.braceStamina : remoteController?.braceStamina ?? 1,
-        hanging: this.body ? this.body.holds.some((h) => h.isStatic) : remoteReactor?.grips.some((grip) => grip.isStatic) ?? false,
+        crouch: this.body ? this.body.crouch > 0.5 : false,
+        brace: this.body ? this.body.braceStamina : 1,
+        hanging: this.body ? this.body.holds.some((h) => h.isStatic) : false,
         objective: this.level.objective,
         running: this.running,
         finished: this.finished,
-        stabilityMargin: this.physicsDiagnostics?.stabilityMargin ?? remoteController?.stabilityMargin ?? 0,
-        supportFeet,
-        gripStress,
-        fallReason: this.physicsDiagnostics?.fallReason ?? remoteController?.fallReason ?? null,
       },
     });
   }
 
   dispose() {
     this.disposed = true;
+    this.clearDelayedEffects();
     cancelAnimationFrame(this.raf);
-    this.cancelScheduledTimeouts();
-    this.remoteInputBuffer.clear();
     window.removeEventListener("resize", this.resize);
+    window.removeEventListener("blur", this.releaseLocalControls);
+    document.removeEventListener("visibilitychange", this.releaseLocalControls);
     this.audio.dispose();
     for (const id of [...this.ghosts.keys()]) this.removeGhost(id);
-    this.scene.remove(this.view.root);
     this.view.dispose();
-    disposeObject3D(this.scene);
-    this.renderer.dispose();
-    this.reactor?.dispose();
-    this.reactor = null;
     if (this.body) this.body.dispose();
+    this.disposeLevelAssets();
+    this.particles.dispose();
+    if (this.sky) {
+      this.sky.removeFromParent();
+      this.sky.geometry.dispose();
+      const materials = Array.isArray(this.sky.material) ? this.sky.material : [this.sky.material];
+      for (const material of materials) material.dispose();
+      this.sky = null;
+      this.skyMat = null;
+    }
+    if (this.water) {
+      this.water.removeFromParent();
+      this.water.geometry.dispose();
+      const materials = Array.isArray(this.water.material) ? this.water.material : [this.water.material];
+      for (const material of materials) material.dispose();
+      this.water = null;
+    }
     this.eventQueue?.free();
     this.world?.free();
+    this.renderer.dispose();
   }
 }
 
 const r3 = (x: number) => Math.round(x * 1000) / 1000;
-
-function disposeObject3D(root: THREE.Object3D) {
-  root.traverse((object) => {
-    const renderable = object as THREE.Object3D & { geometry?: THREE.BufferGeometry; material?: THREE.Material | THREE.Material[] };
-    renderable.geometry?.dispose();
-    const materials = Array.isArray(renderable.material) ? renderable.material : renderable.material ? [renderable.material] : [];
-    for (const material of materials) {
-      for (const value of Object.values(material)) if (value instanceof THREE.Texture) value.dispose();
-      material.dispose();
-    }
-  });
-}
-
-function normalizedQuat(x: number, y: number, z: number, w: number) {
-  const n = Math.hypot(x, y, z, w);
-  if (!Number.isFinite(n) || n < 1e-6 || n > 1e6) return null;
-  return { x: x / n, y: y / n, z: z / n, w: w / n };
-}
-
-function validTransforms(values: unknown): values is number[] {
-  if (!Array.isArray(values) || values.length !== PART_COUNT * 7) return false;
-  for (let i = 0; i < PART_COUNT; i++) {
-    const o = i * 7;
-    if (!values.slice(o, o + 3).every((n) => typeof n === "number" && Number.isFinite(n) && Math.abs(n) <= 1e6)) return false;
-    if (!normalizedQuat(values[o + 3], values[o + 4], values[o + 5], values[o + 6])) return false;
-  }
-  return true;
-}
-
-function validNumbers(values: unknown, length: number, limit: number): values is number[] {
-  return Array.isArray(values) && values.length === length && values.every((n) => typeof n === "number" && Number.isFinite(n) && Math.abs(n) <= limit);
-}
-
-/** Drop malformed or hostile snapshots before they touch rendering/physics. */
-function validateSnapshot(value: unknown): Snap | null {
-  if (!value || typeof value !== "object") return null;
-  const raw = value as Record<string, unknown>;
-  if (!validTransforms(raw.p) || !Array.isArray(raw.props) || raw.props.length % 8 !== 0) return null;
-  if (!validNumbers(raw.props, raw.props.length, 1e6)) return null;
-  for (let i = 0; i + 7 < raw.props.length; i += 8) {
-    if (!Number.isInteger(raw.props[i]) || !normalizedQuat(raw.props[i + 4], raw.props[i + 5], raw.props[i + 6], raw.props[i + 7])) return null;
-  }
-  if (!Array.isArray(raw.ev)) return null;
-  for (const event of raw.ev) {
-    if (!event || typeof event !== "object") return null;
-    const e = event as Record<string, unknown>;
-    if (typeof e.type !== "string" || !Array.isArray(e.pos) || e.pos.length !== 3 || !e.pos.every((n) => typeof n === "number" && Number.isFinite(n) && Math.abs(n) <= 1e6)) return null;
-  }
-  if (!["t", "yaw", "pitch", "timer", "fallen", "score"].every((k) => typeof raw[k] === "number" && Number.isFinite(raw[k]))) return null;
-  if (raw.fallen !== 0 && raw.fallen !== 1) return null;
-  if ((raw.timer as number) < 0 || (raw.timer as number) > 86400 || (raw.score as number) < 0 || (raw.score as number) > 1e6) return null;
-  if (raw.v !== undefined && !validNumbers(raw.v, PART_COUNT * 3, 1e5)) return null;
-  if (raw.av !== undefined && !validNumbers(raw.av, PART_COUNT * 3, 1e5)) return null;
-  if (raw.propMotion !== undefined && (!validNumbers(raw.propMotion, raw.propMotion instanceof Array ? raw.propMotion.length : -1, 1e5) || (raw.propMotion as number[]).length % 7 !== 0)) return null;
-  if (raw.moverT !== undefined && (typeof raw.moverT !== "number" || !Number.isFinite(raw.moverT) || Math.abs(raw.moverT) > 1e6)) return null;
-  if (raw.checkpointIdx !== undefined && (typeof raw.checkpointIdx !== "number" || !Number.isInteger(raw.checkpointIdx))) return null;
-  for (const key of ["delivered", "running", "finished"]) if (raw[key] !== undefined && typeof raw[key] !== "boolean") return null;
-  if (raw.reactor !== undefined && !isPhysicsReactorSnapshot(raw.reactor, PART_COUNT)) return null;
-  if (raw.commentary !== undefined && !isCommentaryCue(raw.commentary)) return null;
-  if (raw.commentaryState !== undefined && !isCommentarySnapshot(raw.commentaryState)) return null;
-  return {
-    t: raw.t as number,
-    p: [...raw.p],
-    v: raw.v ? [...(raw.v as number[])] : undefined,
-    av: raw.av ? [...(raw.av as number[])] : undefined,
-    props: [...raw.props],
-    propMotion: raw.propMotion ? [...(raw.propMotion as number[])] : undefined,
-    moverT: raw.moverT as number | undefined,
-    checkpointIdx: raw.checkpointIdx as number | undefined,
-    delivered: raw.delivered as boolean | undefined,
-    running: raw.running as boolean | undefined,
-    finished: raw.finished as boolean | undefined,
-    yaw: Math.max(-Math.PI, Math.min(Math.PI, raw.yaw as number)),
-    pitch: Math.max(-0.9, Math.min(0.7, raw.pitch as number)),
-    timer: raw.timer as number,
-    fallen: raw.fallen as number,
-    score: raw.score as number,
-    ev: raw.ev as Snap["ev"],
-    msg: typeof raw.msg === "string" && raw.msg.length <= 512 ? raw.msg : undefined,
-    commentary: raw.commentary as CommentaryCue | undefined,
-    commentaryState: raw.commentaryState as CommentarySnapshot | undefined,
-    reactor: raw.reactor as PhysicsReactorSnapshot | undefined,
-  };
-}
+const rv = (x: number) => r3(Math.max(-100, Math.min(100, x)));
 
 function inZone(p: THREE.Vector3, z: ZoneDef) {
   return Math.abs(p.x - z.pos[0]) <= z.size[0] / 2 && Math.abs(p.y - z.pos[1]) <= z.size[1] / 2 && Math.abs(p.z - z.pos[2]) <= z.size[2] / 2;
 }
 
 function isBodyEvent(ev: { type: string }): ev is BodyEvent {
-  return ["step", "land", "grab", "release", "throw", "fall", "getup", "jump", "kick", "shout", "climb", "slip", "drop"].includes(ev.type);
+  return ["step", "land", "grab", "release", "throw", "fall", "getup", "jump", "kick", "shout", "climb"].includes(ev.type);
 }

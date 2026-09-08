@@ -1,773 +1,894 @@
-import type { BodyEvent } from "./body";
-import type { PhysRole, Role, RoleInput } from "./types";
+import type { Role, RoleInput, SquadSize } from "./types";
 
-export const COMMENTARY_STEP_HZ = 120 as const;
+/** The five shipped challenges. Keeping this local makes the commentator pure. */
+export const COMMENTARY_CHALLENGE_IDS = [
+  "wobble-run",
+  "ferry-job",
+  "summit-sync",
+  "egg-express",
+  "slam-dunk",
+] as const;
 
-const NEVER = -1_000_000_000;
-const STABILITY_ENTER_TICKS = 12;
-const STABILITY_EXIT_TICKS = 18;
-const GRIP_ENTER_TICKS = 12;
-const GRIP_EXIT_TICKS = 18;
-const COORDINATION_TICKS = 18;
-const GLOBAL_COOLDOWN_TICKS = Math.round(COMMENTARY_STEP_HZ * 2.2);
-const MIN_CUE_SPACING_TICKS = Math.ceil(COMMENTARY_STEP_HZ / 15);
-const MAX_WIRE_TEXT = 180;
+export type CommentaryChallengeId = (typeof COMMENTARY_CHALLENGE_IDS)[number];
+export type CommentaryKind = "anticipation" | "failure" | "near-fail" | "coordination" | "recovery" | "completion";
+export type CommentaryTone = "bad" | "info" | "good";
 
-export type CommentaryCueKind =
+export interface CommentaryLine {
+  id: string;
+  kind: CommentaryKind;
+  tone: CommentaryTone;
+  text: string;
+}
+
+/**
+ * A cheap snapshot of facts the game already owns. `timeMs` is simulation/run
+ * time, never wall-clock time, so recording and replaying frames is exact.
+ */
+export interface CommentaryFrame {
+  timeMs: number;
+  challengeId: CommentaryChallengeId;
+  running: boolean;
+  finished: boolean;
+  squadSize: SquadSize;
+  inputs: Partial<Record<Role, RoleInput>>;
+  /** Angle from upright, in radians. */
+  pelvisTilt: number;
+  grounded: boolean;
+  fallen: boolean;
+  hanging: boolean;
+  /** Number of hands currently holding something (0, 1, or 2). */
+  holding: number;
+  verticalSpeed: number;
+  horizontalSpeed: number;
+  /** Current brace strength, 0..1. */
+  brace: number;
+  crouch: boolean;
+  /** Current checkpoint index; use -1 before the first checkpoint. */
+  checkpoint: number;
+  score: number;
+  delivery: boolean;
+}
+
+export type CommentaryBodyEventType =
+  | "step"
+  | "land"
+  | "grab"
+  | "release"
+  | "throw"
+  | "fall"
+  | "getup"
+  | "jump"
+  | "kick"
+  | "shout"
+  | "climb";
+
+export interface CommentaryBodyEvent {
+  type: CommentaryBodyEventType;
+  hand?: 0 | 1;
+  propId?: number;
+}
+
+export type CommentaryObjectiveEventType =
   | "start"
-  | "failure"
-  | "near-fail"
-  | "coordination"
-  | "recovery"
+  | "thud"
+  | "bounce"
+  | "splash"
+  | "crack"
   | "checkpoint"
   | "score"
+  | "delivery"
   | "finish";
 
-export type CommentaryTone = "info" | "warning" | "good" | "bad";
-
-export interface CommentaryCue {
-  readonly id: string;
-  readonly tick: number;
-  readonly kind: CommentaryCueKind;
-  readonly tone: CommentaryTone;
-  readonly reason: string;
-  readonly text: string;
+export interface CommentaryObjectiveEvent {
+  type: CommentaryObjectiveEventType;
+  force?: number;
+  /** New checkpoint/score value, when the event already knows it. */
+  value?: number;
+  target?: number;
+  subject?: "player" | "cargo" | "egg" | "core" | "ball";
 }
 
-export interface CommentaryDiagnostics {
-  readonly balance: number;
-  readonly grounded: boolean;
-  readonly fallen: boolean;
-  readonly stabilityMargin?: number;
-  readonly gripStress?: readonly [number, number];
-  readonly supportContacts: number;
-  readonly heldObjects: number;
-  readonly hanging?: boolean;
-  readonly fallReason?: string | null;
+export type CommentaryAction =
+  | { source: "body"; event: CommentaryBodyEvent }
+  | { source: "objective"; event: CommentaryObjectiveEvent };
+
+export interface CommentaryOptions {
+  /** Stable replay/round seed. Strings are hashed deterministically. */
+  seed?: number | string;
+  globalCooldownMs?: number;
+  categoryCooldownMs?: Partial<Record<CommentaryKind, number>>;
 }
 
-export type CommentaryInput = Pick<RoleInput, "f" | "s" | "a" | "b" | "q" | "e">;
-export type CommentaryResolvedInputs = Readonly<Partial<Record<PhysRole, CommentaryInput>>>;
-export type CommentaryRoleInputs = Readonly<Partial<Record<Role, CommentaryInput>>>;
-
-export type CommentaryEvent =
-  | Pick<BodyEvent, "type" | "reason" | "hand" | "propId">
-  | {
-      readonly type: "start" | "retry" | "checkpoint" | "score" | "finish" | "splash" | "crack";
-      readonly value?: number;
-      readonly source?: "body" | "prop";
-      readonly propId?: number;
-    };
-
-export interface CommentaryObjectiveState {
-  readonly running: boolean;
-  readonly finished: boolean;
-  readonly checkpoint: number;
-  readonly score: number;
-  readonly scoreTarget: number;
-}
-
-/** One observation from the authoritative 120 Hz simulation. */
-export interface CommentaryObservation {
-  readonly tick: number;
-  readonly diagnostics: CommentaryDiagnostics;
-  readonly challengeId?: string;
-  readonly events?: readonly CommentaryEvent[];
-  /** Authoritative, physics-facing inputs after seat resolution. */
-  readonly inputs?: CommentaryResolvedInputs;
-  /** Optional pre-resolution seat actions, useful for strict-role replays. */
-  readonly roleInputs?: CommentaryRoleInputs;
-  readonly objective?: CommentaryObjectiveState;
-}
-
-interface DetectorState {
-  stabilityDangerTicks: number;
-  stabilitySafeTicks: number;
-  stabilityActive: boolean;
-  stabilityAnnounced: boolean;
-  gripDangerTicks: number;
-  gripSafeTicks: number;
-  gripActive: boolean;
-  gripAnnounced: boolean;
-  handConflictTicks: number;
-  handsEarlyTicks: number;
-  feetTogetherTicks: number;
-  torsoLeanTicks: number;
-  handConflictLatched: boolean;
-  handsEarlyLatched: boolean;
-  feetTogetherLatched: boolean;
-}
-
-export interface CommentarySnapshot {
-  readonly version: 1;
-  readonly stepHz: typeof COMMENTARY_STEP_HZ;
-  readonly lastTick: number;
-  readonly emittedCount: number;
-  readonly lastCueTick: number;
-  readonly lastText: string | null;
-  readonly lastFallTick: number;
-  readonly previousFallen: boolean;
-  readonly detector: Readonly<DetectorState>;
-  readonly objective: CommentaryObjectiveState | null;
-  readonly lastByKind: Readonly<Record<CommentaryCueKind, number>>;
-  readonly lastByReason: readonly (readonly [string, number])[];
-  readonly variantCursors: readonly (readonly [string, number])[];
+interface NormalizedFrame extends Omit<CommentaryFrame, "timeMs" | "pelvisTilt" | "holding" | "verticalSpeed" | "horizontalSpeed" | "brace" | "checkpoint" | "score"> {
+  timeMs: number;
+  pelvisTilt: number;
+  holding: number;
+  verticalSpeed: number;
+  horizontalSpeed: number;
+  brace: number;
+  checkpoint: number;
+  score: number;
 }
 
 interface Candidate {
-  kind: CommentaryCueKind;
+  kind: CommentaryKind;
   tone: CommentaryTone;
-  priority: number;
-  reason: string;
-  phraseKey: string;
-  phrases: readonly string[];
-  humor?: readonly string[];
-  mark?:
-    | "stability-announced"
-    | "stability-cleared"
-    | "grip-announced"
-    | "grip-cleared"
-    | "hand-conflict-latched"
-    | "hands-early-latched"
-    | "feet-together-latched";
+  topic: string;
+  variants: readonly string[];
+  /** Terminal payoff must not disappear behind a less important line. */
+  terminal?: boolean;
 }
 
-const KINDS: readonly CommentaryCueKind[] = [
-  "start", "failure", "near-fail", "coordination", "recovery", "checkpoint", "score", "finish",
-];
-const TONES: readonly CommentaryTone[] = ["info", "warning", "good", "bad"];
+interface Signals {
+  torsoLeanAt: number;
+  torsoLeanAxis: "forward" | "back" | "left" | "right" | null;
+  torsoLeanAmount: number;
+  bothLegsAt: number;
+  handsUnstableAt: number;
+  legsUnstableAt: number;
+}
 
-const KIND_COOLDOWN: Record<CommentaryCueKind, number> = {
-  start: 120,
-  failure: 120,
-  "near-fail": 600,
-  coordination: 480,
-  recovery: 90,
-  checkpoint: 90,
-  score: 45,
-  finish: 1_000_000_000,
+const DEFAULT_CATEGORY_COOLDOWNS: Record<CommentaryKind, number> = {
+  anticipation: 500,
+  failure: 900,
+  "near-fail": 1_700,
+  coordination: 1_900,
+  recovery: 1_050,
+  completion: 500,
 };
 
-function emptyLastByKind(): Record<CommentaryCueKind, number> {
+const INPUT_DEAD_ZONE = 0.34;
+const DANGER_TILT_ENTER = 0.76;
+const DANGER_TILT_EXIT = 0.46;
+const DANGER_DROP_ENTER = -2.35;
+const DANGER_DROP_EXIT = -0.65;
+const RECENT_CAUSE_MS = 900;
+
+const emptySignals = (): Signals => ({
+  torsoLeanAt: Number.NEGATIVE_INFINITY,
+  torsoLeanAxis: null,
+  torsoLeanAmount: 0,
+  bothLegsAt: Number.NEGATIVE_INFINITY,
+  handsUnstableAt: Number.NEGATIVE_INFINITY,
+  legsUnstableAt: Number.NEGATIVE_INFINITY,
+});
+
+const finite = (value: number | undefined, fallback = 0): number =>
+  typeof value === "number" && Number.isFinite(value) ? value : fallback;
+const clamp = (value: number, min: number, max: number): number => Math.max(min, Math.min(max, value));
+
+const activeAxis = (input: RoleInput | undefined): boolean =>
+  Boolean(input && (Math.abs(input.f) > INPUT_DEAD_ZONE || Math.abs(input.s) > INPUT_DEAD_ZONE));
+
+const handAction = (input: RoleInput | undefined): boolean =>
+  Boolean(input && (activeAxis(input) || input.a || input.b || input.q || input.e));
+
+const sameBoolean = (left: boolean | undefined, right: boolean | undefined): boolean => Boolean(left) === Boolean(right);
+
+function hashString(value: string): number {
+  let hash = 2_166_136_261;
+  for (let i = 0; i < value.length; i++) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 16_777_619);
+  }
+  return hash >>> 0;
+}
+
+function seedNumber(seed: number | string | undefined): number {
+  if (typeof seed === "string") return hashString(seed);
+  return finite(seed ?? 0x51f15e, 0x51f15e) >>> 0;
+}
+
+function mix32(value: number): number {
+  let mixed = value >>> 0;
+  mixed ^= mixed >>> 16;
+  mixed = Math.imul(mixed, 0x7feb352d);
+  mixed ^= mixed >>> 15;
+  mixed = Math.imul(mixed, 0x846ca68b);
+  mixed ^= mixed >>> 16;
+  return mixed >>> 0;
+}
+
+function normaliseFrame(frame: CommentaryFrame): NormalizedFrame {
   return {
-    start: NEVER,
-    failure: NEVER,
-    "near-fail": NEVER,
-    coordination: NEVER,
-    recovery: NEVER,
-    checkpoint: NEVER,
-    score: NEVER,
-    finish: NEVER,
-  };
-}
-
-function emptyDetector(): DetectorState {
-  return {
-    stabilityDangerTicks: 0,
-    stabilitySafeTicks: 0,
-    stabilityActive: false,
-    stabilityAnnounced: false,
-    gripDangerTicks: 0,
-    gripSafeTicks: 0,
-    gripActive: false,
-    gripAnnounced: false,
-    handConflictTicks: 0,
-    handsEarlyTicks: 0,
-    feetTogetherTicks: 0,
-    torsoLeanTicks: 0,
-    handConflictLatched: false,
-    handsEarlyLatched: false,
-    feetTogetherLatched: false,
-  };
-}
-
-const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
-const integer = (value: unknown): value is number => finite(value) && Number.isSafeInteger(value);
-const bool = (value: unknown): value is boolean => typeof value === "boolean";
-const record = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
-
-function validObjective(value: unknown): value is CommentaryObjectiveState {
-  if (!record(value)) return false;
-  return bool(value.running) && bool(value.finished)
-    && integer(value.checkpoint) && value.checkpoint >= -1 && value.checkpoint <= 100
-    && integer(value.score) && value.score >= 0 && value.score <= 10_000
-    && integer(value.scoreTarget) && value.scoreTarget >= 0 && value.scoreTarget <= 10_000;
-}
-
-function validDetector(value: unknown): value is DetectorState {
-  if (!record(value)) return false;
-  const counters = [
-    "stabilityDangerTicks", "stabilitySafeTicks", "gripDangerTicks", "gripSafeTicks",
-    "handConflictTicks", "handsEarlyTicks", "feetTogetherTicks", "torsoLeanTicks",
-  ];
-  const flags = [
-    "stabilityActive", "stabilityAnnounced", "gripActive", "gripAnnounced",
-    "handConflictLatched", "handsEarlyLatched", "feetTogetherLatched",
-  ];
-  if (!counters.every((key) => integer(value[key]) && (value[key] as number) >= 0 && (value[key] as number) <= COMMENTARY_STEP_HZ * 60)
-    || !flags.every((key) => bool(value[key]))) return false;
-  if (!value.stabilityActive && (value.stabilityAnnounced || (value.stabilityDangerTicks as number) >= STABILITY_ENTER_TICKS)) return false;
-  if (!value.gripActive && (value.gripAnnounced || (value.gripDangerTicks as number) >= GRIP_ENTER_TICKS)) return false;
-  if (value.stabilityAnnounced && !value.stabilityActive) return false;
-  if (value.gripAnnounced && !value.gripActive) return false;
-  return true;
-}
-
-const validTimelineTick = (value: unknown, lastTick: number): value is number =>
-  integer(value) && (value === NEVER || (value >= 0 && value <= lastTick));
-
-/** Strict wire validator shared by browser and server snapshot adapters. */
-export function isCommentaryCue(value: unknown): value is CommentaryCue {
-  if (!record(value)) return false;
-  return typeof value.id === "string" && value.id.length > 0 && value.id.length <= 96
-    && integer(value.tick) && value.tick >= 0
-    && KINDS.includes(value.kind as CommentaryCueKind)
-    && TONES.includes(value.tone as CommentaryTone)
-    && typeof value.reason === "string" && value.reason.length > 0 && value.reason.length <= 80
-    && typeof value.text === "string" && value.text.length > 0 && value.text.length <= MAX_WIRE_TEXT;
-}
-
-/** Fast boundary check for host-migration/replay state. */
-export function isCommentarySnapshot(value: unknown): value is CommentarySnapshot {
-  if (!record(value) || value.version !== 1 || value.stepHz !== COMMENTARY_STEP_HZ) return false;
-  if (!integer(value.lastTick) || (value.lastTick as number) < -1) return false;
-  if (!integer(value.emittedCount) || (value.emittedCount as number) < 0 || (value.emittedCount as number) > 1_000_000_000) return false;
-  if (!validTimelineTick(value.lastCueTick, value.lastTick as number) || !validTimelineTick(value.lastFallTick, value.lastTick as number)) return false;
-  if (!(value.lastText === null || (typeof value.lastText === "string" && value.lastText.length <= MAX_WIRE_TEXT))) return false;
-  if (!bool(value.previousFallen) || !validDetector(value.detector)) return false;
-  if (!(value.objective === null || validObjective(value.objective))) return false;
-  const lastByKind = value.lastByKind;
-  if (!record(lastByKind) || !KINDS.every((kind) => validTimelineTick(lastByKind[kind], value.lastTick as number))) return false;
-  if (!Array.isArray(value.lastByReason) || value.lastByReason.length > 64) return false;
-  if (!value.lastByReason.every((entry) => Array.isArray(entry) && entry.length === 2
-    && typeof entry[0] === "string" && entry[0].length > 0 && entry[0].length <= 80
-    && validTimelineTick(entry[1], value.lastTick as number))) return false;
-  if (!Array.isArray(value.variantCursors) || value.variantCursors.length > 64) return false;
-  const valid = value.variantCursors.every((entry) => Array.isArray(entry) && entry.length === 2
-    && typeof entry[0] === "string" && entry[0].length <= 96
-    && integer(entry[1]) && entry[1] >= 0 && entry[1] <= 1_000_000_000);
-  if (!valid) return false;
-  try { return JSON.stringify(value).length <= 8_192; } catch { return false; }
-}
-
-function validInput(value: unknown): value is CommentaryInput {
-  if (!record(value)) return false;
-  return finite(value.f) && Math.abs(value.f) <= 1
-    && finite(value.s) && Math.abs(value.s) <= 1
-    && bool(value.a) && bool(value.b) && bool(value.q) && bool(value.e);
-}
-
-function assertObservation(observation: CommentaryObservation) {
-  if (!record(observation) || !integer(observation.tick) || observation.tick < 0) throw new TypeError("Invalid commentary tick");
-  const d = observation.diagnostics;
-  if (!record(d) || !finite(d.balance) || !bool(d.grounded) || !bool(d.fallen)
-    || !integer(d.supportContacts) || d.supportContacts < 0 || d.supportContacts > 8
-    || !integer(d.heldObjects) || d.heldObjects < 0 || d.heldObjects > 16
-    || (d.hanging !== undefined && !bool(d.hanging))
-    || (d.stabilityMargin !== undefined && !finite(d.stabilityMargin))
-    || (d.fallReason !== undefined && d.fallReason !== null && typeof d.fallReason !== "string")
-    || (d.gripStress !== undefined && (!Array.isArray(d.gripStress) || d.gripStress.length !== 2 || !d.gripStress.every(finite)))) {
-    throw new TypeError("Invalid commentary diagnostics");
-  }
-  if (observation.objective !== undefined && !validObjective(observation.objective)) throw new TypeError("Invalid commentary objective");
-  if (observation.challengeId !== undefined
-    && (typeof observation.challengeId !== "string" || observation.challengeId.length === 0 || observation.challengeId.length > 64)) {
-    throw new TypeError("Invalid commentary challenge");
-  }
-  validateInputRecord(observation.inputs, ["head", "lhand", "rhand", "torso", "lleg", "rleg"]);
-  validateInputRecord(observation.roleInputs, ["arms", "torso", "legs", "lhand", "rhand", "lleg", "rleg", "head"]);
-}
-
-function validateInputRecord(value: unknown, allowed: readonly string[]) {
-  if (value === undefined) return;
-  if (!record(value)) throw new TypeError("Invalid commentary inputs");
-  for (const role of Object.keys(value)) {
-    if (!allowed.includes(role) || !validInput(value[role])) throw new TypeError("Invalid commentary inputs");
-  }
-}
-
-function axisMagnitude(input: CommentaryInput | undefined): number {
-  return input ? Math.hypot(input.f, input.s) : 0;
-}
-
-function updateCounter(current: number, condition: boolean, maximum = COMMENTARY_STEP_HZ * 4): number {
-  return condition ? Math.min(maximum, current + 1) : Math.max(0, current - 2);
-}
-
-function hasEvent(events: readonly CommentaryEvent[], type: CommentaryEvent["type"]): boolean {
-  return events.some((event) => event.type === type);
-}
-
-function eventOf(events: readonly CommentaryEvent[], type: CommentaryEvent["type"]): CommentaryEvent | undefined {
-  return events.find((event) => event.type === type);
-}
-
-function failureCopy(reason: string, detector: DetectorState): Pick<Candidate, "reason" | "phraseKey" | "phrases" | "humor"> {
-  if (reason === "no-foot-support") {
-    const coordinatedCause = detector.feetTogetherTicks >= 8;
-    return {
-      reason,
-      phraseKey: coordinatedCause ? "fall-feet-together" : "fall-no-support",
-      phrases: coordinatedCause
-        ? ["The body fell because both feet left support together.", "Both feet moved at once, so the body ran out of floor."]
-        : ["The body fell after losing all foot support.", "No planted foot was left to catch the body."],
-      humor: ["Both feet took the same day off."],
-    };
-  }
-  if (reason === "capture-point-outside-support") {
-    if (detector.handsEarlyTicks >= 8) {
-      return {
-        reason,
-        phraseKey: "fall-hands-before-stable",
-        phrases: ["The hands moved before the body was stable.", "The hands were moving while support was already unstable."],
-        humor: ["The hands filed the plan before the feet approved it."],
-      };
-    }
-    if (detector.torsoLeanTicks >= 8) {
-      return {
-        reason,
-        phraseKey: "fall-torso-lean",
-        phrases: ["The body fell because the torso leaned beyond the feet.", "The torso moved outside the planted support."],
-        humor: ["The torso arrived before the feet did."],
-      };
-    }
-    return {
-      reason,
-      phraseKey: "fall-capture-point",
-      phrases: ["Momentum carried the body beyond its planted feet.", "The balance point moved outside the available support."],
-      humor: ["Momentum submitted a plan without consulting the feet."],
-    };
-  }
-  if (reason === "excessive-tilt") {
-    return {
-      reason,
-      phraseKey: "fall-tilt",
-      phrases: ["The body tipped too far to recover.", "The torso leaned past the recoverable angle."],
-      humor: ["Gravity won that very brief committee meeting."],
-    };
-  }
-  return {
-    reason: reason || "fall",
-    phraseKey: "fall-generic",
-    phrases: ["The body lost balance and went down.", "That wobble crossed the point of recovery."],
-    humor: ["Gravity collected its tiny membership fee."],
+    ...frame,
+    timeMs: Math.max(0, finite(frame.timeMs)),
+    pelvisTilt: Math.abs(finite(frame.pelvisTilt)),
+    holding: Math.round(clamp(finite(frame.holding), 0, 2)),
+    verticalSpeed: finite(frame.verticalSpeed),
+    horizontalSpeed: Math.max(0, finite(frame.horizontalSpeed)),
+    brace: clamp(finite(frame.brace), 0, 1),
+    checkpoint: Math.trunc(finite(frame.checkpoint, -1)),
+    score: Math.max(0, Math.trunc(finite(frame.score))),
   };
 }
 
 /**
- * Deterministic, host-side commentary policy. It observes the game; it never
- * owns physics, scoring, controls, networking, or wall-clock time.
+ * Pure, synchronous gameplay commentary. One method call yields at most one
+ * line and all causal memory is fixed-size.
  */
-export class CommentaryDirector {
-  private lastTick = -1;
-  private emittedCount = 0;
-  private lastCueTick = NEVER;
-  private lastText: string | null = null;
-  private lastFallTick = NEVER;
-  private previousFallen = false;
-  private detector = emptyDetector();
-  private objective: CommentaryObjectiveState | null = null;
-  private lastByKind = emptyLastByKind();
-  private lastByReason = new Map<string, number>();
-  private variantCursors = new Map<string, number>();
+export class CommentarySystem {
+  private seed: number;
+  private readonly initialSeed: number;
+  private readonly globalCooldownMs: number;
+  private readonly categoryCooldownMs: Record<CommentaryKind, number>;
+  private nowMs = 0;
+  private sequence = 0;
+  private context: NormalizedFrame | null = null;
+  private previous: NormalizedFrame | null = null;
+  private signals: Signals = emptySignals();
+  private topicCounts = new Map<string, number>();
+  private lastGlobalAt = Number.NEGATIVE_INFINITY;
+  private lastCategoryAt: Record<CommentaryKind, number> = {
+    anticipation: Number.NEGATIVE_INFINITY,
+    failure: Number.NEGATIVE_INFINITY,
+    "near-fail": Number.NEGATIVE_INFINITY,
+    coordination: Number.NEGATIVE_INFINITY,
+    recovery: Number.NEGATIVE_INFINITY,
+    completion: Number.NEGATIVE_INFINITY,
+  };
+  private lastText = "";
+  private dangerLatched = false;
+  private dangerStartedAt = Number.NEGATIVE_INFINITY;
+  private grabMismatchLatched = false;
+  private throwMismatchLatched = false;
+  private handMovementMismatchLatched = false;
+  private simultaneousLegsLatched = false;
+  private unstableHandsLatched = false;
+  private unstableLegsLatched = false;
+  private lostGripAt = Number.NEGATIVE_INFINITY;
+  private lastFallAt = Number.NEGATIVE_INFINITY;
+  private announcedCheckpoint = -1;
+  private announcedScore = 0;
+  private deliveryAnnounced = false;
+  private finishAnnounced = false;
 
-  reset(options: { preservePhrases?: boolean } = {}): void {
-    const preservePhrases = options.preservePhrases === true;
-    const emittedCount = this.emittedCount;
-    const lastText = this.lastText;
-    const variantCursors = this.variantCursors;
-    this.lastTick = -1;
-    this.emittedCount = preservePhrases ? emittedCount : 0;
-    this.lastCueTick = NEVER;
-    this.lastText = preservePhrases ? lastText : null;
-    this.lastFallTick = NEVER;
-    this.previousFallen = false;
-    this.detector = emptyDetector();
-    this.objective = null;
-    this.lastByKind = emptyLastByKind();
-    this.lastByReason = new Map();
-    this.variantCursors = preservePhrases ? variantCursors : new Map();
-  }
-
-  capture(): CommentarySnapshot {
-    const snapshot: CommentarySnapshot = {
-      version: 1,
-      stepHz: COMMENTARY_STEP_HZ,
-      lastTick: this.lastTick,
-      emittedCount: this.emittedCount,
-      lastCueTick: this.lastCueTick,
-      lastText: this.lastText,
-      lastFallTick: this.lastFallTick,
-      previousFallen: this.previousFallen,
-      detector: { ...this.detector },
-      objective: this.objective ? { ...this.objective } : null,
-      lastByKind: { ...this.lastByKind },
-      lastByReason: [...this.lastByReason.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0),
-      variantCursors: [...this.variantCursors.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0),
+  constructor(options: CommentaryOptions = {}) {
+    this.seed = seedNumber(options.seed);
+    this.initialSeed = this.seed;
+    this.globalCooldownMs = Math.max(0, finite(options.globalCooldownMs ?? 650));
+    this.categoryCooldownMs = {
+      ...DEFAULT_CATEGORY_COOLDOWNS,
+      ...options.categoryCooldownMs,
     };
-    Object.freeze(snapshot.detector);
-    if (snapshot.objective) Object.freeze(snapshot.objective);
-    Object.freeze(snapshot.lastByKind);
-    for (const entry of snapshot.lastByReason) Object.freeze(entry);
-    Object.freeze(snapshot.lastByReason);
-    for (const entry of snapshot.variantCursors) Object.freeze(entry);
-    Object.freeze(snapshot.variantCursors);
-    return Object.freeze(snapshot);
+    for (const kind of Object.keys(this.categoryCooldownMs) as CommentaryKind[]) {
+      this.categoryCooldownMs[kind] = Math.max(0, finite(this.categoryCooldownMs[kind]));
+    }
   }
 
-  restore(value: unknown): boolean {
-    if (!isCommentarySnapshot(value)) return false;
-    this.lastTick = value.lastTick;
-    this.emittedCount = value.emittedCount;
-    this.lastCueTick = value.lastCueTick;
-    this.lastText = value.lastText;
-    this.lastFallTick = value.lastFallTick;
-    this.previousFallen = value.previousFallen;
-    this.detector = { ...value.detector };
-    this.objective = value.objective ? { ...value.objective } : null;
-    this.lastByKind = { ...value.lastByKind };
-    this.lastByReason = new Map(value.lastByReason);
-    this.variantCursors = new Map(value.variantCursors);
-    return true;
+  /** Restore exact initial replay state. Passing a seed starts a new replay. */
+  reset(seed: number | string = this.initialSeed): void {
+    this.seed = seedNumber(seed);
+    this.nowMs = 0;
+    this.sequence = 0;
+    this.context = null;
+    this.previous = null;
+    this.signals = emptySignals();
+    this.topicCounts.clear();
+    this.clearCooldowns();
+    this.lastText = "";
+    this.clearTransientState();
+    this.announcedCheckpoint = -1;
+    this.announcedScore = 0;
+    this.deliveryAnnounced = false;
+    this.finishAnnounced = false;
   }
 
-  step(observation: CommentaryObservation): CommentaryCue | null {
-    assertObservation(observation);
-    if (this.lastTick >= 0 && observation.tick !== this.lastTick + 1) {
-      throw new RangeError(`Commentary ticks must be contiguous at ${COMMENTARY_STEP_HZ} Hz`);
-    }
-    this.lastTick = observation.tick;
+  /** Observe a frame and report its highest-value state change, if any. */
+  update(frame: CommentaryFrame): CommentaryLine | null {
+    const current = this.observe(frame);
+    const previous = this.previous;
+    let candidate: Candidate | null = null;
 
-    const events = observation.events ?? [];
-    const d = observation.diagnostics;
-    const candidates: Candidate[] = [];
-    this.updateRecentActions(observation);
-    this.updateDangerEpisodes(d);
-
-    const fallEvent = eventOf(events, "fall");
-    const fellNow = !!fallEvent || (d.fallen && !this.previousFallen);
-    const gotUpNow = hasEvent(events, "getup") || (!d.fallen && this.previousFallen);
-    if (fellNow) {
-      this.lastFallTick = observation.tick;
-      const eventReason = fallEvent && "reason" in fallEvent ? fallEvent.reason : undefined;
-      const copy = failureCopy(eventReason ?? d.fallReason ?? "fall", this.detector);
-      candidates.push({ kind: "failure", tone: "bad", priority: 100, ...copy });
-      // A fall terminates the near-fall episode. The explicit get-up event is
-      // the only recovery signal while the body is down.
-      this.detector.stabilityActive = false;
-      this.detector.stabilityAnnounced = false;
-      this.detector.stabilityDangerTicks = 0;
-      this.detector.stabilitySafeTicks = 0;
-    }
-
-    if (hasEvent(events, "drop") || hasEvent(events, "slip")) {
-      candidates.push({
-        kind: "coordination", tone: "warning", priority: 82, reason: "grip-lost", phraseKey: "grip-lost",
-        phrases: ["The grip gave way under the load.", "The load slipped after grip stress peaked."],
-        humor: ["The cargo has briefly chosen independence."],
-      });
-      // Losing the object is not a successful grip recovery and must not be
-      // followed by a stale strain warning on the next tick.
-      this.clearGripEpisode();
-    }
-
-    if (hasEvent(events, "splash")) {
-      const splash = eventOf(events, "splash");
-      const source = splash && "source" in splash ? splash.source : undefined;
-      const propCopy = observation.challengeId === "egg-express"
-        ? ["The egg hit the water — it reset to the start.", "The egg splashed down; steady the next carry from spawn."]
-        : observation.challengeId === "slam-dunk"
-          ? ["The ball dropped out — it reset to its spawn.", "Ball reset. Set the body before the next throw."]
-          : ["The cargo hit the water — it reset to the start.", "The load splashed down; secure the next carry from spawn."];
-      candidates.push({
-        kind: "failure", tone: "bad", priority: 102, reason: "splash", phraseKey: `splash-${source ?? "generic"}`,
-        phrases: source === "body" ? ["The body hit the water — recover from the last checkpoint.", "The platform was missed; reset and go again."] : source === "prop" ? propCopy : ["Splash — recover from the last checkpoint.", "The water claimed that attempt; reset and go again."],
-        humor: ["The water has accepted another volunteer."],
-      });
-    }
-    if (hasEvent(events, "crack")) {
-      candidates.push({
-        kind: "failure", tone: "bad", priority: 103, reason: "egg-cracked", phraseKey: "egg-cracked",
-        phrases: ["The egg cracked under the impact.", "Too much impact — the egg did not survive that landing."],
-        humor: ["The omelette route was not the objective."],
-      });
-    }
-
-    if (gotUpNow) {
-      const clutch = observation.tick - this.lastFallTick <= COMMENTARY_STEP_HZ * 4;
-      candidates.push({
-        kind: "recovery", tone: "good", priority: 88, reason: clutch ? "clutch-getup" : "getup",
-        phraseKey: clutch ? "clutch-getup" : "getup",
-        phrases: clutch ? ["Great recovery.", "Clutch recovery — the body is upright again."] : ["Back upright.", "Balance restored."],
-        humor: clutch ? ["The wobble has been professionally denied."] : undefined,
-      });
-    }
-
-    this.addObjectiveCandidates(observation, events, candidates);
-    this.addDangerCandidates(d, candidates);
-    this.addCoordinationCandidates(d, candidates);
-
-    this.previousFallen = d.fallen;
-    if (observation.objective) this.objective = { ...observation.objective };
-
-    const available = candidates
-      .filter((candidate) => observation.tick - (this.lastByReason.get(candidate.reason) ?? NEVER) >= KIND_COOLDOWN[candidate.kind])
-      .filter((candidate) => {
-        const firstSafetyCue = (candidate.kind === "near-fail" || candidate.kind === "coordination")
-          && !this.lastByReason.has(candidate.reason);
-        return candidate.priority >= 74 || firstSafetyCue || observation.tick - this.lastCueTick >= GLOBAL_COOLDOWN_TICKS;
-      })
-      .filter((candidate) => candidate.priority >= 100 || observation.tick - this.lastCueTick >= MIN_CUE_SPACING_TICKS)
-      .sort((a, b) => b.priority - a.priority || KINDS.indexOf(a.kind) - KINDS.indexOf(b.kind));
-    const chosen = available[0];
-    if (!chosen) return null;
-
-    const text = this.pickPhrase(chosen);
-    this.lastByKind[chosen.kind] = observation.tick;
-    this.lastByReason.set(chosen.reason, observation.tick);
-    this.lastCueTick = observation.tick;
-    this.lastText = text;
-    this.emittedCount++;
-    this.applyMark(chosen.mark);
-    return Object.freeze({
-      id: `${observation.tick}:${chosen.kind}:${this.emittedCount}`,
-      tick: observation.tick,
-      kind: chosen.kind,
-      tone: chosen.tone,
-      reason: chosen.reason,
-      text,
-    });
-  }
-
-  private updateRecentActions(observation: CommentaryObservation) {
-    const inputs = observation.inputs;
-    const roles = observation.roleInputs;
-    const d = observation.diagnostics;
-    const leftHand = inputs?.lhand ?? roles?.lhand ?? roles?.arms;
-    const rightHand = inputs?.rhand ?? roles?.rhand ?? roles?.arms;
-    const leftLeg = inputs?.lleg ?? roles?.lleg ?? roles?.legs;
-    const rightLeg = inputs?.rleg ?? roles?.rleg ?? roles?.legs;
-    const torso = inputs?.torso ?? roles?.torso;
-    const handMismatch = leftHand && rightHand
-      ? Math.hypot(leftHand.f - rightHand.f, leftHand.s - rightHand.s)
-      : 0;
-    const handMotion = Math.max(axisMagnitude(leftHand), axisMagnitude(rightHand));
-    const feetTogether = !!leftLeg && !!rightLeg
-      && axisMagnitude(leftLeg) > 0.65 && axisMagnitude(rightLeg) > 0.65
-      && Math.hypot(leftLeg.f - rightLeg.f, leftLeg.s - rightLeg.s) < 0.3;
-    const unstable = d.hanging !== true && d.grounded && (d.stabilityMargin ?? 1) < -0.04;
-
-    this.detector.handConflictTicks = updateCounter(this.detector.handConflictTicks, d.heldObjects > 0 && handMismatch > 1.15);
-    this.detector.handsEarlyTicks = updateCounter(this.detector.handsEarlyTicks, handMotion > 0.65 && unstable && !d.fallen, Math.round(COMMENTARY_STEP_HZ * 1.4));
-    this.detector.feetTogetherTicks = updateCounter(this.detector.feetTogetherTicks, feetTogether && !d.fallen);
-    this.detector.torsoLeanTicks = updateCounter(this.detector.torsoLeanTicks, axisMagnitude(torso) > 0.65 && !d.fallen);
-
-    if (this.detector.handConflictTicks === 0) this.detector.handConflictLatched = false;
-    if (this.detector.handsEarlyTicks === 0) this.detector.handsEarlyLatched = false;
-    if (this.detector.feetTogetherTicks === 0) this.detector.feetTogetherLatched = false;
-  }
-
-  private updateDangerEpisodes(d: CommentaryDiagnostics) {
-    const margin = d.stabilityMargin ?? 1;
-    const stabilityDanger = d.hanging !== true && !d.fallen && d.grounded && margin <= -0.08;
-    const stabilitySafe = d.hanging !== true && !d.fallen && d.grounded && margin >= 0.04;
-    this.detector.stabilityDangerTicks = stabilityDanger ? Math.min(COMMENTARY_STEP_HZ * 60, this.detector.stabilityDangerTicks + 1) : Math.max(0, this.detector.stabilityDangerTicks - 2);
-    this.detector.stabilitySafeTicks = stabilitySafe ? Math.min(STABILITY_EXIT_TICKS, this.detector.stabilitySafeTicks + 1) : 0;
-    if (d.hanging) {
-      this.detector.stabilityActive = false;
-      this.detector.stabilityAnnounced = false;
-      this.detector.stabilityDangerTicks = 0;
-      this.detector.stabilitySafeTicks = 0;
-    } else {
-      if (!this.detector.stabilityActive && this.detector.stabilityDangerTicks >= STABILITY_ENTER_TICKS) {
-        this.detector.stabilityActive = true;
-        this.detector.stabilityAnnounced = false;
-        this.detector.stabilitySafeTicks = 0;
-      }
-      if (this.detector.stabilityActive && !this.detector.stabilityAnnounced && this.detector.stabilitySafeTicks >= STABILITY_EXIT_TICKS) {
-        this.detector.stabilityActive = false;
-        this.detector.stabilityDangerTicks = 0;
-        this.detector.stabilitySafeTicks = 0;
+    if (!previous) {
+      this.announcedCheckpoint = current.checkpoint;
+      this.announcedScore = current.score;
+      this.deliveryAnnounced = current.delivery;
+      this.finishAnnounced = current.finished;
+    } else if (current.running || current.finished || previous.running) {
+      if (current.finished && !previous.finished && !this.finishAnnounced) {
+        this.finishAnnounced = true;
+        candidate = this.finishCandidate(current.challengeId);
+      } else if (current.fallen && !previous.fallen && this.nowMs - this.lastFallAt > 80) {
+        this.lastFallAt = this.nowMs;
+        candidate = this.fallCandidate();
+      } else if (current.delivery && !previous.delivery && !this.deliveryAnnounced) {
+        this.deliveryAnnounced = true;
+        candidate = this.deliveryCandidate(current.challengeId);
+      } else if (current.score > previous.score && current.score > this.announcedScore) {
+        this.announcedScore = current.score;
+        candidate = this.scoreCandidate(current.challengeId, current.score);
+      } else if (current.checkpoint > previous.checkpoint && current.checkpoint > this.announcedCheckpoint) {
+        this.announcedCheckpoint = current.checkpoint;
+        candidate = this.checkpointCandidate(current.challengeId, current.checkpoint);
+      } else {
+        candidate = this.recoveryCandidate(previous, current) ?? this.dangerCandidate(current) ?? this.coordinationCandidate(current);
       }
     }
 
-    if (d.heldObjects === 0) {
-      this.clearGripEpisode();
-      return;
-    }
-    const grip = d.gripStress ? Math.max(d.gripStress[0], d.gripStress[1]) : 0;
-    const gripDanger = d.heldObjects > 0 && grip >= 0.72;
-    const gripSafe = d.heldObjects === 0 || grip <= 0.52;
-    this.detector.gripDangerTicks = gripDanger ? Math.min(COMMENTARY_STEP_HZ * 60, this.detector.gripDangerTicks + 1) : Math.max(0, this.detector.gripDangerTicks - 2);
-    this.detector.gripSafeTicks = gripSafe ? Math.min(GRIP_EXIT_TICKS, this.detector.gripSafeTicks + 1) : 0;
-    if (!this.detector.gripActive && this.detector.gripDangerTicks >= GRIP_ENTER_TICKS) {
-      this.detector.gripActive = true;
-      this.detector.gripAnnounced = false;
-      this.detector.gripSafeTicks = 0;
-    }
-    if (this.detector.gripActive && !this.detector.gripAnnounced && this.detector.gripSafeTicks >= GRIP_EXIT_TICKS) {
-      this.clearGripEpisode();
-    }
+    this.updateGripState(previous, current);
+    this.previous = current;
+    return candidate ? this.emit(candidate) : null;
   }
 
-  private addDangerCandidates(d: CommentaryDiagnostics, candidates: Candidate[]) {
-    const currentlyUnstable = d.hanging !== true && !d.fallen && d.grounded && (d.stabilityMargin ?? 1) <= -0.08;
-    if (this.detector.stabilityActive && !this.detector.stabilityAnnounced && currentlyUnstable) {
-      candidates.push({
-        kind: "near-fail", tone: "warning", priority: 66, reason: "stability-low", phraseKey: "stability-low",
-        phrases: ["The body is outside its stable base — steady it.", "Balance is nearly gone; plant before the next move."],
-        humor: ["The wobble meter is making ambitious career choices."], mark: "stability-announced",
-      });
-    } else if (this.detector.stabilityActive && this.detector.stabilitySafeTicks >= STABILITY_EXIT_TICKS && this.detector.stabilityAnnounced) {
-      candidates.push({
-        kind: "recovery", tone: "good", priority: 74, reason: "stability-recovered", phraseKey: "stability-recovered",
-        phrases: ["Great recovery.", "The body is stable again — keep the rhythm."],
-        humor: ["That wobble has been returned to sender."], mark: "stability-cleared",
-      });
-    }
+  /** Feed an event from RagdollBody. The most recently observed frame is used. */
+  onBodyEvent(event: CommentaryBodyEvent, frame?: CommentaryFrame): CommentaryLine | null {
+    if (frame) this.observe(frame);
+    const current = this.context;
+    if (!current || (!current.running && event.type !== "getup")) return null;
 
-    const grip = d.gripStress ? Math.max(d.gripStress[0], d.gripStress[1]) : 0;
-    const currentlyStrained = d.heldObjects > 0 && grip >= 0.72;
-    if (this.detector.gripActive && !this.detector.gripAnnounced && currentlyStrained) {
-      candidates.push({
-        kind: "near-fail", tone: "warning", priority: 70, reason: "grip-strained", phraseKey: "grip-strained",
-        phrases: ["The grip is close to slipping — steady the load.", "Grip strain is rising; share the load evenly."],
-        humor: ["The cargo is considering an escape route."], mark: "grip-announced",
-      });
-    } else if (this.detector.gripActive && this.detector.gripSafeTicks >= GRIP_EXIT_TICKS && this.detector.gripAnnounced) {
-      candidates.push({
-        kind: "recovery", tone: "good", priority: 76, reason: "grip-recovered", phraseKey: "grip-recovered",
-        phrases: ["Nice save — the grip is secure again.", "The hands settled and the load is stable."],
-        humor: ["Cargo escape attempt: cancelled."], mark: "grip-cleared",
-      });
-    }
-  }
-
-  private clearGripEpisode() {
-    this.detector.gripActive = false;
-    this.detector.gripAnnounced = false;
-    this.detector.gripDangerTicks = 0;
-    this.detector.gripSafeTicks = 0;
-  }
-
-  private addCoordinationCandidates(d: CommentaryDiagnostics, candidates: Candidate[]) {
-    if (this.detector.handConflictTicks >= COORDINATION_TICKS && !this.detector.handConflictLatched) {
-      candidates.push({
-        kind: "coordination", tone: "warning", priority: 72, reason: "hands-opposed", phraseKey: "hands-opposed",
-        phrases: ["The hands are pulling against each other.", "The hands disagree on direction; align before lifting."],
-        humor: ["The left and right hands have opened negotiations."],
-        mark: "hand-conflict-latched",
-      });
-    }
-    if (this.detector.handsEarlyTicks >= COORDINATION_TICKS && !this.detector.handsEarlyLatched) {
-      candidates.push({
-        kind: "coordination", tone: "warning", priority: 69, reason: "hands-before-stable", phraseKey: "hands-before-stable",
-        phrases: ["The hands moved before the body was stable.", "Set the feet, then commit the hands."],
-        humor: ["The hands skipped ahead in the choreography."],
-        mark: "hands-early-latched",
-      });
-    }
-    if (this.detector.feetTogetherTicks >= COORDINATION_TICKS && !this.detector.feetTogetherLatched && d.supportContacts < 2) {
-      candidates.push({
-        kind: "coordination", tone: "warning", priority: 68, reason: "feet-together", phraseKey: "feet-together",
-        phrases: ["Both feet committed at once; alternate to keep support.", "One foot needs to stay planted while the other moves."],
-        humor: ["The feet synchronized the one move they should not."],
-        mark: "feet-together-latched",
-      });
-    }
-  }
-
-  private addObjectiveCandidates(observation: CommentaryObservation, events: readonly CommentaryEvent[], candidates: Candidate[]) {
-    const next = observation.objective;
-    const previous = this.objective;
-    const started = hasEvent(events, "start") || hasEvent(events, "retry") || (!!previous && !!next && !previous.running && next.running);
-    const checkpoint = hasEvent(events, "checkpoint") || (!!previous && !!next && next.checkpoint > previous.checkpoint);
-    const scored = hasEvent(events, "score") || (!!previous && !!next && next.score > previous.score);
-    const finished = hasEvent(events, "finish") || (!!previous && !!next && !previous.finished && next.finished);
-    if (started) {
-      const startCopy = this.challengeStartCopy(observation.challengeId);
-      candidates.push({
-        kind: "start", tone: "info", priority: 55, reason: hasEvent(events, "retry") ? "retry" : "start",
-        phraseKey: `start-${observation.challengeId ?? "generic"}`, ...startCopy,
-      });
-    }
-    if (checkpoint) candidates.push({
-      kind: "checkpoint", tone: "good", priority: 84, reason: "checkpoint", phraseKey: "checkpoint",
-      phrases: ["Checkpoint secured.", "Progress locked in — next challenge."],
-      humor: ["Checkpoint acquired. Gravity may file an appeal."],
-    });
-    if (scored) {
-      const score = next?.score;
-      const target = next?.scoreTarget;
-      const summit = observation.challengeId === "summit-sync";
-      const slam = observation.challengeId === "slam-dunk" && score !== undefined && target;
-      candidates.push({
-        kind: "score", tone: "good", priority: 90, reason: summit ? "core-placed" : "score", phraseKey: summit ? "core-placed" : "score",
-        phrases: summit
-          ? ["Core locked. The timing gate is next.", "The core is settled — now beat the gate."]
-          : slam
-            ? [`Clean basket — ${Math.max(0, target - score)} left.`, `Score ${score}/${target}. Reset for the next throw.`]
-            : score !== undefined && target
-              ? [`Clean payoff — ${score} of ${target}.`, `Score ${score}/${target}. Keep the sequence.`]
-              : ["That counted — clean finish.", "Score secured."],
-        humor: summit ? ["Core accepted. Mountain paperwork complete."] : ["Physics has reluctantly awarded the point."],
-      });
-    }
-    if (finished) {
-      const clutch = observation.tick - this.lastByKind.recovery <= COMMENTARY_STEP_HZ * 3;
-      candidates.push({
-        kind: "finish", tone: "good", priority: 110, reason: clutch ? "clutch-finish" : "finish", phraseKey: clutch ? "clutch-finish" : "finish",
-        phrases: clutch ? ["Clutch finish — the recovery held.", "Saved it, then finished the job."] : ["Challenge complete — coordinated chaos, converted.", "Finished. The recovery and timing paid off."],
-        humor: clutch ? ["Recovery into victory. Completely according to plan."] : ["Victory achieved with the normal amount of structural dignity."],
-      });
-    }
-  }
-
-  private challengeStartCopy(challengeId: string | undefined): Pick<Candidate, "phrases" | "humor"> {
-    switch (challengeId) {
-      case "wobble-run":
-        return { phrases: ["Bridge ahead — settle the body before each narrow step.", "Find the rhythm before the first obstacle."], humor: ["The bridge is narrow; confidence may remain unnecessarily wide."] };
-      case "ferry-job":
-        return { phrases: ["Ferries move fast — secure the cargo before committing.", "Share the load, then move with the ferry."], humor: ["The cargo has not purchased swimming lessons."] };
-      case "summit-sync":
-        return { phrases: ["Climb in sequence: plant, reach, then pull.", "The summit rewards patient coordination first."], humor: ["The mountain has reviewed the plan and remains skeptical."] };
-      case "egg-express":
-        return { phrases: ["Gentle hands — stabilize before moving the egg.", "Protect the egg: smooth starts, softer landings."], humor: ["The egg requests a strictly omelette-free journey."] };
-      case "slam-dunk":
-        return { phrases: ["Set the body, align the hands, then release.", "Balance first; the throw starts from stable feet."], humor: ["The hoop accepts style, but only after points."] };
+    let candidate: Candidate | null = null;
+    switch (event.type) {
+      case "fall":
+        if (this.nowMs - this.lastFallAt > 80) {
+          this.lastFallAt = this.nowMs;
+          candidate = this.fallCandidate();
+        }
+        break;
+      case "getup":
+        candidate = {
+          kind: "recovery",
+          tone: "good",
+          topic: "body.getup",
+          variants: ["Great recovery. Back on your feet.", "Back upright—nice save.", "Gravity filed a complaint. Denied."],
+        };
+        this.dangerLatched = false;
+        break;
+      case "grab":
+        if (this.nowMs - this.lostGripAt <= 2_000) {
+          candidate = {
+            kind: "recovery",
+            tone: "good",
+            topic: "body.regrab",
+            variants: ["Regrab secured. Keep it steady.", "Grip recovered—carry on.", "Caught it on the sequel."],
+          };
+          this.lostGripAt = Number.NEGATIVE_INFINITY;
+        }
+        break;
+      case "release":
+        if (current.holding > 0 || current.hanging) this.lostGripAt = this.nowMs;
+        break;
+      case "land":
+        if (current.pelvisTilt < DANGER_TILT_EXIT && current.verticalSpeed > DANGER_DROP_EXIT && this.dangerLatched) {
+          candidate = this.stabilisedCandidate("landing");
+          this.dangerLatched = false;
+        }
+        break;
+      case "climb":
+        candidate = {
+          kind: "recovery",
+          tone: "good",
+          topic: "body.climb",
+          variants: ["Ledge cleared. Clean recovery.", "Up and over—nice coordination.", "The ledge has been negotiated with."],
+        };
+        this.dangerLatched = false;
+        break;
       default:
-        return { phrases: ["Ready — find the rhythm, then commit.", "Steady first. Fast comes after."], humor: ["Coordination is mandatory; dignity remains optional."] };
+        break;
+    }
+    return candidate ? this.emit(candidate) : null;
+  }
+
+  /** Feed an objective/level event (splash, checkpoint, score, and so on). */
+  onObjectiveEvent(event: CommentaryObjectiveEvent, frame?: CommentaryFrame): CommentaryLine | null {
+    if (frame) this.observe(frame);
+    const current = this.context;
+    if (!current) return null;
+
+    let candidate: Candidate | null = null;
+    switch (event.type) {
+      case "start":
+        candidate = this.startCandidate(current.challengeId);
+        break;
+      case "splash":
+        candidate = this.splashCandidate(current.challengeId, event.subject);
+        break;
+      case "crack":
+        candidate = {
+          kind: "failure",
+          tone: "bad",
+          topic: "egg-express.crack",
+          variants: [
+            "The egg cracked—gentler hands next carry.",
+            "Too much impact for the egg. Reset and soften the landing.",
+            "That egg is now emotionally scrambled.",
+          ],
+        };
+        break;
+      case "checkpoint": {
+        const inferred = event.value === undefined ? this.announcedCheckpoint + 1 : event.value;
+        const value = Math.max(current.checkpoint, Math.trunc(finite(inferred, current.checkpoint)));
+        if (value > this.announcedCheckpoint) {
+          this.announcedCheckpoint = value;
+          candidate = this.checkpointCandidate(current.challengeId, value);
+        }
+        break;
+      }
+      case "score": {
+        const inferred = event.value === undefined ? this.announcedScore + 1 : event.value;
+        const value = Math.max(current.score, Math.trunc(finite(inferred, current.score)));
+        if (value > this.announcedScore || current.challengeId === "summit-sync" && !this.deliveryAnnounced) {
+          this.announcedScore = value;
+          if (current.challengeId === "summit-sync") this.deliveryAnnounced = true;
+          candidate = this.scoreCandidate(current.challengeId, value, event.target);
+        }
+        break;
+      }
+      case "delivery":
+        if (!this.deliveryAnnounced) {
+          this.deliveryAnnounced = true;
+          candidate = this.deliveryCandidate(current.challengeId);
+        }
+        break;
+      case "finish":
+        if (!this.finishAnnounced) {
+          this.finishAnnounced = true;
+          candidate = this.finishCandidate(current.challengeId);
+        }
+        break;
+      case "thud":
+        if ((event.force ?? 0) >= 0.68) {
+          candidate = {
+            kind: "near-fail",
+            tone: "info",
+            topic: `${current.challengeId}.hard-impact`,
+            variants: ["Hard impact. Settle the body before the next move.", "That landing nearly got away—stabilize first."],
+          };
+        }
+        break;
+      case "bounce":
+        if ((event.force ?? 0) >= 0.58 && current.holding > 0) {
+          candidate = {
+            kind: "near-fail",
+            tone: "info",
+            topic: `${current.challengeId}.cargo-bounce`,
+            variants: ["The cargo bounced—settle it before moving.", "Wobbly cargo. Give it one beat."],
+          };
+        }
+        break;
+    }
+    return candidate ? this.emit(candidate) : null;
+  }
+
+  /** Generic action API for callers that keep body and level events together. */
+  handle(action: CommentaryAction, frame?: CommentaryFrame): CommentaryLine | null {
+    return action.source === "body"
+      ? this.onBodyEvent(action.event, frame)
+      : this.onObjectiveEvent(action.event, frame);
+  }
+
+  private observe(frame: CommentaryFrame): NormalizedFrame {
+    const next = normaliseFrame(frame);
+    const challengeChanged = Boolean(this.context && this.context.challengeId !== next.challengeId);
+    const clockRewound = Boolean(this.context && next.timeMs < this.context.timeMs);
+    if (challengeChanged || clockRewound) {
+      this.previous = null;
+      this.signals = emptySignals();
+      this.clearTransientState();
+      this.clearCooldowns();
+      this.lastText = "";
+      this.announcedCheckpoint = -1;
+      this.announcedScore = 0;
+      this.deliveryAnnounced = false;
+      this.finishAnnounced = false;
+    }
+    this.context = next;
+    this.nowMs = next.timeMs;
+    this.recordSignals(next);
+    return next;
+  }
+
+  private recordSignals(frame: NormalizedFrame): void {
+    const torso = frame.inputs.torso;
+    if (torso) {
+      const forwardAmount = Math.abs(torso.f);
+      const sideAmount = Math.abs(torso.s);
+      const amount = Math.max(forwardAmount, sideAmount);
+      if (amount >= 0.62) {
+        this.signals.torsoLeanAt = this.nowMs;
+        this.signals.torsoLeanAmount = amount;
+        this.signals.torsoLeanAxis = forwardAmount >= sideAmount
+          ? torso.f >= 0 ? "forward" : "back"
+          : torso.s >= 0 ? "right" : "left";
+      }
+    }
+
+    const unstable = frame.pelvisTilt >= 0.54 || !frame.grounded;
+    const leftHand = frame.inputs.lhand;
+    const rightHand = frame.inputs.rhand;
+    const handsMoving = frame.squadSize === 3
+      ? handAction(frame.inputs.arms)
+      : handAction(leftHand) || handAction(rightHand);
+    if (handsMoving && unstable) this.signals.handsUnstableAt = this.nowMs;
+
+    if (frame.squadSize === 3 && activeAxis(frame.inputs.legs) && unstable) {
+      this.signals.legsUnstableAt = this.nowMs;
+    }
+    if (frame.squadSize === 5 && activeAxis(frame.inputs.lleg) && activeAxis(frame.inputs.rleg)) {
+      this.signals.bothLegsAt = this.nowMs;
     }
   }
 
-  private pickPhrase(candidate: Candidate): string {
-    const useHumor = !!candidate.humor?.length && (this.emittedCount + 1) % 5 === 0;
-    const pool = useHumor ? candidate.humor! : candidate.phrases;
-    const key = `${candidate.phraseKey}:${useHumor ? "humor" : "normal"}`;
-    let cursor = this.variantCursors.get(key) ?? 0;
-    let text = pool[cursor % pool.length];
-    if (text === this.lastText && pool.length > 1) {
-      cursor++;
-      text = pool[cursor % pool.length];
+  private fallCandidate(): Candidate {
+    const axis = this.signals.torsoLeanAxis;
+    if (axis && this.nowMs - this.signals.torsoLeanAt <= RECENT_CAUSE_MS && this.signals.torsoLeanAmount >= 0.74) {
+      const label = axis === "back" ? "backward" : axis;
+      return {
+        kind: "failure",
+        tone: "bad",
+        topic: `fall.torso-${axis}`,
+        variants: [
+          `You fell because the torso leaned too far ${label}.`,
+          `Too much ${label} lean tipped the body over.`,
+          `The torso outran the feet on that ${label} lean.`,
+        ],
+      };
     }
-    this.variantCursors.set(key, cursor + 1);
-    return text;
+    if (this.nowMs - this.signals.bothLegsAt <= RECENT_CAUSE_MS) {
+      return {
+        kind: "failure",
+        tone: "bad",
+        topic: "fall.simultaneous-legs",
+        variants: [
+          "Both legs moved together, so the body lost its base.",
+          "The legs stepped at once; alternate to keep a base.",
+          "Both legs voted ‘now.’ Gravity agreed.",
+        ],
+      };
+    }
+    if (this.nowMs - this.signals.handsUnstableAt <= RECENT_CAUSE_MS) {
+      return {
+        kind: "failure",
+        tone: "bad",
+        topic: "fall.hands-before-balance",
+        variants: [
+          "The hands moved before the body was stable.",
+          "The body was still wobbling when the hands moved.",
+          "Hands went early; balance never caught up.",
+        ],
+      };
+    }
+    if (this.nowMs - this.signals.legsUnstableAt <= RECENT_CAUSE_MS) {
+      return {
+        kind: "failure",
+        tone: "bad",
+        topic: "fall.legs-before-balance",
+        variants: ["The legs moved before the torso had settled.", "That step arrived before balance did."],
+      };
+    }
+    if ((this.context?.horizontalSpeed ?? 0) > 4.2) {
+      return {
+        kind: "failure",
+        tone: "bad",
+        topic: "fall.speed",
+        variants: ["Too much sideways speed carried the body over.", "Momentum won that argument. Slow the setup."],
+      };
+    }
+    return {
+      kind: "failure",
+      tone: "bad",
+      topic: "fall.balance",
+      variants: ["The body went past its balance point.", "The base slipped outside the body—reset and brace."],
+    };
   }
 
-  private applyMark(mark: Candidate["mark"]) {
-    if (mark === "stability-announced") this.detector.stabilityAnnounced = true;
-    if (mark === "stability-cleared") {
-      this.detector.stabilityActive = false;
-      this.detector.stabilityAnnounced = false;
-      this.detector.stabilityDangerTicks = 0;
-      this.detector.stabilitySafeTicks = 0;
+  private dangerCandidate(frame: NormalizedFrame): Candidate | null {
+    if (frame.fallen) return null;
+    const entering = frame.pelvisTilt >= DANGER_TILT_ENTER
+      || (!frame.grounded && !frame.hanging && frame.verticalSpeed <= DANGER_DROP_ENTER);
+    const exiting = frame.pelvisTilt <= DANGER_TILT_EXIT
+      && (frame.grounded || frame.hanging)
+      && frame.verticalSpeed >= DANGER_DROP_EXIT;
+
+    if (!this.dangerLatched && entering) {
+      this.dangerLatched = true;
+      this.dangerStartedAt = this.nowMs;
+      if (!frame.grounded && frame.verticalSpeed <= DANGER_DROP_ENTER) {
+        return {
+          kind: "near-fail",
+          tone: "info",
+          topic: "danger.drop",
+          variants: ["Fast drop—find a handhold or prepare the landing.", "Ground is arriving quickly. Brace the landing."],
+        };
+      }
+      const torso = frame.inputs.torso;
+      const direction = torso && Math.max(Math.abs(torso.f), Math.abs(torso.s)) > 0.45
+        ? Math.abs(torso.f) >= Math.abs(torso.s)
+          ? torso.f >= 0 ? "forward" : "back"
+          : torso.s >= 0 ? "right" : "left"
+        : null;
+      const crouchedCarry = frame.crouch && frame.holding > 0;
+      return {
+        kind: "near-fail",
+        tone: "info",
+        topic: `danger.tilt-${direction ?? "unknown"}`,
+        variants: crouchedCarry
+          ? ["Crouch is set; now let the loaded torso settle.", "Keep the cargo low and ease the lean back."]
+          : direction
+          ? [`Heavy ${direction} lean—brace or ease the torso back.`, `Balance is going ${direction}. Give the feet a beat.`]
+          : ["Balance is on the edge—brace and let it settle.", "That wobble is one move from a fall."],
+      };
     }
-    if (mark === "grip-announced") this.detector.gripAnnounced = true;
-    if (mark === "grip-cleared") {
-      this.clearGripEpisode();
+    if (this.dangerLatched && exiting) {
+      this.dangerLatched = false;
+      if (this.nowMs - this.dangerStartedAt >= 120) return this.stabilisedCandidate("wobble");
     }
-    if (mark === "hand-conflict-latched") this.detector.handConflictLatched = true;
-    if (mark === "hands-early-latched") this.detector.handsEarlyLatched = true;
-    if (mark === "feet-together-latched") this.detector.feetTogetherLatched = true;
+    return null;
+  }
+
+  private recoveryCandidate(previous: NormalizedFrame, current: NormalizedFrame): Candidate | null {
+    if (previous.fallen && !current.fallen) {
+      this.dangerLatched = false;
+      return {
+        kind: "recovery",
+        tone: "good",
+        topic: "state.getup",
+        variants: ["Great recovery. Back on your feet.", "Back upright—nice save.", "Gravity filed a complaint. Denied."],
+      };
+    }
+    if (previous.hanging && !current.hanging && current.grounded && !current.fallen) {
+      this.dangerLatched = false;
+      return {
+        kind: "recovery",
+        tone: "good",
+        topic: "state.mantle",
+        variants: ["Clutch pull-up. You found solid ground.", "Hanging to standing—great recovery."],
+      };
+    }
+    if (current.holding > previous.holding && this.nowMs - this.lostGripAt <= 2_000) {
+      this.lostGripAt = Number.NEGATIVE_INFINITY;
+      return {
+        kind: "recovery",
+        tone: "good",
+        topic: "state.regrab",
+        variants: ["Regrab secured. Keep it steady.", "Grip recovered—carry on.", "Caught it on the sequel."],
+      };
+    }
+    if (this.dangerLatched
+      && previous.brace < 0.55
+      && current.brace >= 0.55
+      && current.pelvisTilt <= previous.pelvisTilt - 0.08) {
+      this.dangerLatched = false;
+      return this.stabilisedCandidate("brace");
+    }
+    return null;
+  }
+
+  private coordinationCandidate(frame: NormalizedFrame): Candidate | null {
+    const unstable = frame.pelvisTilt >= 0.54 || !frame.grounded;
+    if (frame.squadSize === 5) {
+      const leftHand = frame.inputs.lhand;
+      const rightHand = frame.inputs.rhand;
+      const grabMismatch = !sameBoolean(leftHand?.a, rightHand?.a);
+      const throwMismatch = frame.holding > 0 && !sameBoolean(leftHand?.b, rightHand?.b);
+      const handDelta = Math.abs((leftHand?.f ?? 0) - (rightHand?.f ?? 0))
+        + Math.abs((leftHand?.s ?? 0) - (rightHand?.s ?? 0));
+      const handMovementMismatch = handDelta > 0.8 && (activeAxis(leftHand) || activeAxis(rightHand));
+      const simultaneousLegs = activeAxis(frame.inputs.lleg) && activeAxis(frame.inputs.rleg);
+      const unstableHands = unstable && (handAction(leftHand) || handAction(rightHand));
+
+      let candidate: Candidate | null = null;
+      if (grabMismatch && !this.grabMismatchLatched) {
+        candidate = {
+          kind: "coordination",
+          tone: "info",
+          topic: "coord.split-grab",
+          variants: ["Both hands need Space together for a two-hand grab.", "One hand called grab; the other missed the meeting."],
+        };
+      } else if (throwMismatch && !this.throwMismatchLatched) {
+        candidate = {
+          kind: "coordination",
+          tone: "info",
+          topic: "coord.split-throw",
+          variants: ["Both hands need Shift together to throw.", "The throw needs two yes votes from the hands."],
+        };
+      } else if (handMovementMismatch && !this.handMovementMismatchLatched) {
+        candidate = {
+          kind: "coordination",
+          tone: "info",
+          topic: "coord.split-hand-move",
+          variants: ["The hands split directions—match the swing first.", "Left and right hands are steering different plans."],
+        };
+      } else if (simultaneousLegs && !this.simultaneousLegsLatched) {
+        candidate = {
+          kind: "coordination",
+          tone: "info",
+          topic: "coord.simultaneous-legs",
+          variants: ["Both legs moved together; alternate the steps.", "One leg, then the other. The floor appreciates rhythm."],
+        };
+      } else if (unstableHands && !this.unstableHandsLatched) {
+        candidate = {
+          kind: "coordination",
+          tone: "info",
+          topic: "coord.hands-before-balance",
+          variants: ["The hands moved before the body was stable.", "Let the torso settle, then move the hands."],
+        };
+      }
+      this.grabMismatchLatched = grabMismatch;
+      this.throwMismatchLatched = throwMismatch;
+      this.handMovementMismatchLatched = handMovementMismatch;
+      this.simultaneousLegsLatched = simultaneousLegs;
+      this.unstableHandsLatched = unstableHands;
+      return candidate;
+    }
+
+    const armsUnstable = unstable && handAction(frame.inputs.arms);
+    const legsUnstable = unstable && activeAxis(frame.inputs.legs);
+    let candidate: Candidate | null = null;
+    if (armsUnstable && !this.unstableHandsLatched) {
+      candidate = {
+        kind: "coordination",
+        tone: "info",
+        topic: "coord.arms-before-balance",
+        variants: ["The hands moved before the body was stable.", "Let the torso settle, then move the arms."],
+      };
+    } else if (legsUnstable && !this.unstableLegsLatched) {
+      candidate = {
+        kind: "coordination",
+        tone: "info",
+        topic: "coord.legs-before-balance",
+        variants: ["The legs moved before the torso was stable.", "Give the torso one beat, then step."],
+      };
+    }
+    this.unstableHandsLatched = armsUnstable;
+    this.unstableLegsLatched = legsUnstable;
+    return candidate;
+  }
+
+  private updateGripState(previous: NormalizedFrame | null, current: NormalizedFrame): void {
+    if (!previous) return;
+    if ((previous.holding > current.holding || previous.hanging && !current.hanging) && !current.fallen) {
+      this.lostGripAt = this.nowMs;
+    }
+  }
+
+  private stabilisedCandidate(source: "wobble" | "landing" | "brace"): Candidate {
+    return {
+      kind: "recovery",
+      tone: "good",
+      topic: `recovery.${source}`,
+      variants: source === "landing"
+        ? ["Landing held. Great recovery.", "That landing wobbled, then stuck."]
+        : source === "brace"
+          ? ["Brace caught the wobble. Great recovery.", "Clutch brace—the body is back under control."]
+        : ["Great recovery. The wobble is under control.", "Clutch stabilization—now move.", "Chaos contained. Mostly."],
+    };
+  }
+
+  private checkpointCandidate(challenge: CommentaryChallengeId, checkpoint: number): Candidate {
+    const number = checkpoint + 1;
+    const variants: Record<CommentaryChallengeId, readonly string[]> = {
+      "wobble-run": [`Checkpoint ${number}. The bridge is behind you.`, `Checkpoint ${number} locked. Keep the rhythm.`],
+      "ferry-job": [`Checkpoint ${number}. Cargo route secured.`, `Checkpoint ${number} locked—steady on the ferries.`],
+      "summit-sync": [`Summit checkpoint ${number}. Higher and harder.`, `Checkpoint ${number}. The peak is listening.`],
+      "egg-express": [`Checkpoint ${number}. The egg still has a future.`, `Checkpoint ${number}. Shell status: heroic.`],
+      "slam-dunk": [`Checkpoint ${number}.`, `Progress saved at checkpoint ${number}.`],
+    };
+    return { kind: "completion", tone: "good", topic: `${challenge}.checkpoint`, variants: variants[challenge] };
+  }
+
+  private startCandidate(challenge: CommentaryChallengeId): Candidate {
+    const variants: Record<CommentaryChallengeId, readonly string[]> = {
+      "wobble-run": ["Hurdles first, bridge later. Keep the torso over the feet.", "Find the walking rhythm before the bridge finds you."],
+      "ferry-job": ["Cargo, low bar, moving ferries. Same beat, everyone.", "Secure the cargo, then let the ferries come to you."],
+      "summit-sync": ["Climb, carry, then beat the gate. Breathe while you can.", "The summit wants one clean chain of teamwork."],
+      "egg-express": ["That egg has one health point. Gentle hands.", "Soft grab, steady carry, intact breakfast."],
+      "slam-dunk": ["Three baskets. Agree on the grab before the throw.", "Set the feet, match the hands, then launch."],
+    };
+    return { kind: "anticipation", tone: "info", topic: `${challenge}.start`, variants: variants[challenge] };
+  }
+
+  private scoreCandidate(challenge: CommentaryChallengeId, score: number, target = 3): Candidate {
+    if (challenge === "slam-dunk") {
+      return {
+        kind: "completion",
+        tone: "good",
+        topic: "slam-dunk.score",
+        variants: [`Basket ${score}/${target}. Nice release.`, `Score ${score}/${target}. Keep that timing.`, `${score}/${target}. The hoop approves.`],
+      };
+    }
+    if (challenge === "summit-sync") {
+      return {
+        kind: "completion",
+        tone: "good",
+        topic: "summit-sync.core",
+        variants: ["Core placed. Now sprint the timing gate.", "Core is stable—gate run starts now."],
+      };
+    }
+    return this.deliveryCandidate(challenge);
+  }
+
+  private deliveryCandidate(challenge: CommentaryChallengeId): Candidate {
+    const variants: Record<CommentaryChallengeId, readonly string[]> = {
+      "wobble-run": ["Objective delivered. Nicely coordinated."],
+      "ferry-job": ["Cargo delivered. Ferry crew: surprisingly professional.", "Cargo is down safe. Excellent teamwork."],
+      "summit-sync": ["Core placed. Now sprint the timing gate.", "Core stable. The gate is the final push."],
+      "egg-express": ["Egg delivered intact. Breakfast remains optional.", "Safe delivery. Not a crack in sight."],
+      "slam-dunk": ["Ball delivered. Now finish the set."],
+    };
+    return { kind: "completion", tone: "good", topic: `${challenge}.delivery`, variants: variants[challenge] };
+  }
+
+  private finishCandidate(challenge: CommentaryChallengeId): Candidate {
+    const variants: Record<CommentaryChallengeId, readonly string[]> = {
+      "wobble-run": ["Finish gate cleared. That chaos had rhythm.", "Wobble Run complete—clutch all the way."],
+      "ferry-job": ["Cargo delivered. Shift complete.", "Ferry Job complete—nothing important went swimming."],
+      "summit-sync": ["Core placed, gate beaten. Summit complete.", "Summit Sync complete. That final push was clutch."],
+      "egg-express": ["Egg delivered intact. Flawless-ish.", "Egg Express complete. The shell survives."],
+      "slam-dunk": ["Three baskets. Game, set, wobble.", "Slam Dunk complete. Coordination found the hoop."],
+    };
+    return {
+      kind: "completion",
+      tone: "good",
+      topic: `${challenge}.finish`,
+      variants: variants[challenge],
+      terminal: true,
+    };
+  }
+
+  private splashCandidate(challenge: CommentaryChallengeId, subject?: CommentaryObjectiveEvent["subject"]): Candidate {
+    const variants: Record<CommentaryChallengeId, readonly string[]> = {
+      "wobble-run": ["Splash. The bridge wins this round.", "Water reset—line up the next crossing."],
+      "ferry-job": subject === "cargo"
+        ? ["Cargo overboard. Reset and sync the handoff.", "The cargo took the express ferry downward."]
+        : ["Ferry missed. Reset and time the next step.", "Unscheduled swim. The dock is ready again."],
+      "summit-sync": subject === "core"
+        ? ["Core dropped. Rebuild the carry rhythm.", "The summit rejected that delivery route."]
+        : ["The canyon collected that attempt. Reset.", "Long way down; short retry."],
+      "egg-express": ["Egg overboard. Reset with softer hands.", "The egg found water. It was not part of the recipe."],
+      "slam-dunk": ["Ball out of bounds. Set up the next throw.", "That ball chose swimming over scoring."],
+    };
+    return { kind: "failure", tone: "bad", topic: `${challenge}.splash`, variants: variants[challenge] };
+  }
+
+  private emit(candidate: Candidate): CommentaryLine | null {
+    if (!candidate.terminal) {
+      if (this.nowMs - this.lastGlobalAt < this.globalCooldownMs) return null;
+      if (this.nowMs - this.lastCategoryAt[candidate.kind] < this.categoryCooldownMs[candidate.kind]) return null;
+    }
+    if (candidate.variants.length === 0) return null;
+
+    const topicCount = this.topicCounts.get(candidate.topic) ?? 0;
+    const stable = mix32(this.seed ^ hashString(candidate.topic) ^ Math.imul(topicCount + 1, 0x9e3779b1));
+    let index = stable % candidate.variants.length;
+    if (candidate.variants[index] === this.lastText && candidate.variants.length > 1) {
+      index = (index + 1) % candidate.variants.length;
+    }
+    const text = candidate.variants[index];
+    if (text === this.lastText) return null;
+
+    this.sequence += 1;
+    this.topicCounts.set(candidate.topic, topicCount + 1);
+    this.lastText = text;
+    this.lastGlobalAt = this.nowMs;
+    this.lastCategoryAt[candidate.kind] = this.nowMs;
+    return {
+      id: `commentary-${this.seed.toString(36)}-${this.sequence.toString(36)}-${hashString(candidate.topic).toString(36)}`,
+      kind: candidate.kind,
+      tone: candidate.tone,
+      text,
+    };
+  }
+
+  private clearCooldowns(): void {
+    this.lastGlobalAt = Number.NEGATIVE_INFINITY;
+    for (const kind of Object.keys(this.lastCategoryAt) as CommentaryKind[]) {
+      this.lastCategoryAt[kind] = Number.NEGATIVE_INFINITY;
+    }
+  }
+
+  private clearTransientState(): void {
+    this.dangerLatched = false;
+    this.dangerStartedAt = Number.NEGATIVE_INFINITY;
+    this.grabMismatchLatched = false;
+    this.throwMismatchLatched = false;
+    this.handMovementMismatchLatched = false;
+    this.simultaneousLegsLatched = false;
+    this.unstableHandsLatched = false;
+    this.unstableLegsLatched = false;
+    this.lostGripAt = Number.NEGATIVE_INFINITY;
+    this.lastFallAt = Number.NEGATIVE_INFINITY;
   }
 }
+
+export const createCommentarySystem = (options?: CommentaryOptions): CommentarySystem => new CommentarySystem(options);

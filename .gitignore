@@ -1,27 +1,50 @@
-# deps
+# dependencies
 node_modules/
+.pnpm-store/
+.pnp
+.pnp.js
 
-# next
+# next.js
 .next/
 out/
+build/
+.test-dist/
 
-# env (never commit secrets)
+# vite / test outputs
+dist/
+test-results/
+.impeccable/
+
+# local review screenshots and dev logs (generated, never committed)
+review-*.png
+dev-server.log
+
+# misc
+.DS_Store
+__pycache__/
+*.pem
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# env (single local .env holds real values; .env.example documents shapes only)
 .env
-.env*.local
-.env*.development
-.env*.production
+.env.*
+!.env.example
+
+# local-only agent context (deliberately untracked; see history)
+PRODUCT.md
 
 # typescript
 *.tsbuildinfo
 
-# vercel
-.vercel/
+# spacetimedb local state
+spacetimedb-local/
+.spacetime/
+*.spacetimecloud
+scripts/e2e.mjs
 
-# local browser QA state
-.playwright-cli/
+# spacetimedb module build output
+server/dist/
 
-# os
-.DS_Store
-Thumbs.db
-
-.vercel
+.playwright-mcp/

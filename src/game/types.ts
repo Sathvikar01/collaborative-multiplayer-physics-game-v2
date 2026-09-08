@@ -1,4 +1,4 @@
-export const PHYS_ROLES = ["head", "lhand", "rhand", "torso", "lleg", "rleg"] as const;
+export const PHYS_ROLES = ["head", "arms", "torso", "lleg", "rleg"] as const;
 export type PhysRole = (typeof PHYS_ROLES)[number];
 
 // Squad roles players actually pick. 3-player: arms+torso+legs. 5-player: split hands + split legs.
@@ -81,6 +81,7 @@ export const ROLE_INFO: Record<Role, { label: string; short: string; emoji: stri
       { key: "A D", does: "Lean left / right" },
       { key: "Shift", does: "Crouch (reach the floor)" },
       { key: "Space", does: "Brace / GET UP" },
+      { key: "Q", does: "Call out to the team" },
     ],
   },
   lleg: {
@@ -130,7 +131,6 @@ export interface PlayerInfo {
   teamId: number;
   roles: Role[];
   ready: boolean;
-  connected: boolean;
 }
 
 export interface TeamInfo {
@@ -150,7 +150,6 @@ export interface RoomSnapshot {
   teams: TeamInfo[];
   startAt: number | null;
   round: number;
-  version: number;
   now: number;
   leaderId: string | null;
 }
@@ -159,23 +158,19 @@ export interface ChallengeMeta {
   id: string;
   name: string;
   tagline: string;
-  goal: string;
   icon: string;
   difficulty: "easy" | "medium" | "hard" | "bonus";
-  players: string;
 }
 
 export const CHALLENGES: ChallengeMeta[] = [
-  { id: "wobble-run", name: "Wobble Run", tagline: "Easy — hurdles, a skinny bridge, a ramp and a wall.", goal: "Reach the finish gate", icon: "🏁", difficulty: "easy", players: "3 or 5" },
-  { id: "ferry-job", name: "Ferry Job", tagline: "Medium — grab the cargo, ride sliding ferries, don't drop it.", goal: "Carry the cargo to the glowing pad", icon: "📦", difficulty: "medium", players: "3 or 5" },
-  { id: "summit-sync", name: "Summit Sync", tagline: "Hard — climb, cross sinking ferries, place the core, beat the gate.", goal: "Place the core, then sprint the timing gate", icon: "⛰️", difficulty: "hard", players: "3 or 5" },
-  { id: "egg-express", name: "Egg Express", tagline: "Bonus — carry the giant egg. Do NOT drop it.", goal: "Deliver the egg to the pad", icon: "🥚", difficulty: "bonus", players: "3 or 5" },
-  { id: "slam-dunk", name: "Slam Dunk", tagline: "Bonus — pick up balls. Throw them in the hoop.", goal: "Score 3 baskets", icon: "🏀", difficulty: "bonus", players: "3 or 5" },
+  { id: "wobble-run", name: "Wobble Run", tagline: "Easy — hurdles, moving bumpers, a skinny bridge and a co-op climb.", icon: "🏁", difficulty: "easy" },
+  { id: "ferry-job", name: "Ferry Job", tagline: "Medium — grab the cargo, ride sliding ferries, don't drop it.", icon: "📦", difficulty: "medium" },
+  { id: "summit-sync", name: "Summit Sync", tagline: "Hard — climb, cross sinking ferries, place the core, beat the gate.", icon: "⛰️", difficulty: "hard" },
+  { id: "egg-express", name: "Egg Express", tagline: "Bonus — crouch, cross a ferry and keep the fragile egg intact.", icon: "🥚", difficulty: "bonus" },
+  { id: "slam-dunk", name: "Slam Dunk", tagline: "Bonus — dodge moving defenders and throw three balls through the hoop.", icon: "🏀", difficulty: "bonus" },
 ];
 
 export const TEAM_COLORS = ["#ff5d5d", "#4fa8ff", "#ffd23f", "#6ef29a", "#c58bff", "#ff9a3c"];
-
-export const MAX_TEAM_SIZE = 5;
 
 export function formatTime(ms: number | null | undefined): string {
   if (ms == null) return "--:--.--";

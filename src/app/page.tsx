@@ -1,108 +1,296 @@
 "use client";
 
-import { useEffect, useState, type CSSProperties } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { CHALLENGES, ROLES_5, ROLE_INFO, formatTime, type SquadSize } from "@/game/types";
-import { RoleGlyph } from "@/components/RoleGlyph";
+import { CHALLENGES, ROLES_5, ROLE_INFO } from "@/game/types";
+import { createRoomCode, normalizeRoomCode, roomCodeError } from "./room-code";
+import { ChallengeIcon, RoleIcon } from "@/components/icons";
 
-interface ScoreRow {
-  id: number;
-  teamName: string;
-  players: string[];
-  timeMs: number;
-}
-
-const ROOM_CODE_PATTERN = /^[A-HJ-NP-Z2-9]{4}$/;
-
-function makeCode() {
-  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  const random = crypto.getRandomValues(new Uint8Array(4));
-  let c = "";
-  for (const value of random) c += chars[value % chars.length];
-  return c;
-}
-
-function GameplayWorld() {
-  return (
-    <div className="world-frame" aria-label="A stylized view of the Many Hands physics world" role="img">
-      <div className="world-frame__hud world-frame__hud--top"><span className="world-frame__status-dot" /><span>LIVE WORLD</span><span className="world-frame__hud-muted">SIM 01 / 60 FPS</span></div>
-      <svg className="world-scene" viewBox="0 0 780 620" fill="none" aria-hidden="true">
-        <defs>
-          <linearGradient id="sky" x1="390" y1="0" x2="390" y2="620" gradientUnits="userSpaceOnUse"><stop stopColor="#202A31" /><stop offset="0.58" stopColor="#11191D" /><stop offset="1" stopColor="#070A0C" /></linearGradient>
-          <linearGradient id="water" x1="390" y1="305" x2="390" y2="620" gradientUnits="userSpaceOnUse"><stop stopColor="#20383B" /><stop offset="1" stopColor="#091113" /></linearGradient>
-          <linearGradient id="platform" x1="265" y1="395" x2="593" y2="527" gradientUnits="userSpaceOnUse"><stop stopColor="#8C806B" /><stop offset="1" stopColor="#514B42" /></linearGradient>
-          <linearGradient id="body" x1="370" y1="190" x2="490" y2="444" gradientUnits="userSpaceOnUse"><stop stopColor="#DEE4DF" /><stop offset="0.5" stopColor="#A3B0A9" /><stop offset="1" stopColor="#64736E" /></linearGradient>
-          <linearGradient id="suit" x1="402" y1="258" x2="491" y2="397" gradientUnits="userSpaceOnUse"><stop stopColor="#D9D5BD" /><stop offset="1" stopColor="#928B6C" /></linearGradient>
-          <filter id="softShadow" x="-30%" y="-30%" width="160%" height="180%"><feGaussianBlur stdDeviation="16" /></filter>
-          <filter id="glow" x="-80%" y="-80%" width="260%" height="260%"><feGaussianBlur stdDeviation="8" result="blur" /><feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge></filter>
-          <pattern id="grid" width="42" height="42" patternUnits="userSpaceOnUse"><path d="M42 0H0V42" stroke="#DDE5DF" strokeOpacity=".08" /></pattern>
-        </defs>
-        <rect width="780" height="620" fill="url(#sky)" />
-        <path d="M0 300C126 263 178 294 286 266C396 238 498 257 780 208V620H0V300Z" fill="url(#water)" />
-        <path d="M0 349C126 311 202 334 306 310C447 277 574 293 780 246" stroke="#9AAFA7" strokeOpacity=".16" strokeWidth="2" /><path d="M0 392C126 357 202 379 306 354C447 321 574 337 780 290" stroke="#9AAFA7" strokeOpacity=".11" /><path d="M0 435C126 400 202 422 306 397C447 364 574 380 780 333" stroke="#9AAFA7" strokeOpacity=".08" />
-        <path d="M0 0H780V620H0Z" fill="url(#grid)" />
-        <path d="M116 360L269 319L634 409L478 466L116 360Z" fill="#101516" fillOpacity=".55" filter="url(#softShadow)" /><path d="M107 328L258 294L639 390L482 447L107 328Z" fill="url(#platform)" stroke="#B7AA91" strokeOpacity=".5" strokeWidth="2" /><path d="M258 294L258 346L482 497L482 447L258 294Z" fill="#625C51" /><path d="M482 447L639 390L639 439L482 497V447Z" fill="#3B3934" /><path d="M154 325L260 301L589 383L485 421L154 325Z" stroke="#ECE5D1" strokeOpacity=".16" strokeWidth="2" />
-        <path d="M220 289L175 214" stroke="#9FAEAA" strokeOpacity=".54" strokeWidth="3" /><path d="M175 214L159 223L179 228L190 211L175 214Z" fill="#D5DDDA" /><path d="M550 368L614 298" stroke="#9FAEAA" strokeOpacity=".54" strokeWidth="3" /><path d="M614 298L629 309L609 310L601 293L614 298Z" fill="#D5DDDA" />
-        <ellipse cx="412" cy="448" rx="132" ry="24" fill="#020404" fillOpacity=".6" filter="url(#softShadow)" /><g filter="url(#glow)"><circle cx="447" cy="150" r="6" fill="#C2FF7A" /><circle cx="447" cy="150" r="13" stroke="#C2FF7A" strokeOpacity=".22" /></g>
-        <g><path d="M395 183C405 160 439 153 463 169L481 196L465 235L398 231L381 205L395 183Z" fill="url(#body)" stroke="#EAF2EB" strokeOpacity=".55" strokeWidth="2" /><path d="M406 173C421 159 450 160 462 175L456 203L411 201L406 173Z" fill="#4C5754" /><path d="M414 180L431 174L450 181L446 193L419 191L414 180Z" fill="#D8E4DF" fillOpacity=".8" /><path d="M397 225L473 225L493 335L420 370L383 320L397 225Z" fill="url(#suit)" stroke="#E5E5D2" strokeOpacity=".44" strokeWidth="2" /><path d="M422 235L449 237L457 328L424 340L410 306L422 235Z" fill="#646554" fillOpacity=".8" /><path d="M401 235L371 281L327 293L333 309L388 302L423 263L401 235Z" fill="url(#body)" stroke="#EAF2EB" strokeOpacity=".4" strokeWidth="2" /><path d="M470 235L501 275L546 287L540 303L487 294L450 262L470 235Z" fill="url(#body)" stroke="#EAF2EB" strokeOpacity=".4" strokeWidth="2" /><path d="M327 293L315 300L331 305L344 300L327 293ZM546 287L559 292L545 300L531 295L546 287Z" fill="#D8E1DB" /><path d="M421 340L404 415L383 445L399 451L436 421L448 352L421 340Z" fill="url(#body)" stroke="#EAF2EB" strokeOpacity=".4" strokeWidth="2" /><path d="M454 335L470 405L501 436L488 446L448 419L427 351L454 335Z" fill="url(#body)" stroke="#EAF2EB" strokeOpacity=".4" strokeWidth="2" /><path d="M383 444L399 451L382 465L358 460L365 448L383 444ZM501 436L513 447L498 459L480 447L488 441L501 436Z" fill="#DCE3DD" /></g>
-        <path d="M289 348L331 358M530 358L572 345" stroke="#C2FF7A" strokeOpacity=".85" strokeWidth="2" strokeDasharray="5 8" /><circle cx="289" cy="348" r="4" fill="#C2FF7A" /><circle cx="572" cy="345" r="4" fill="#C2FF7A" />
-      </svg>
-      <div className="world-frame__hud world-frame__hud--bottom"><span>SYNCED BODY</span><span className="world-frame__meter"><span /></span><span>72%</span></div>
-      <div className="world-frame__caption">A body is only as coordinated as its loudest friend.</div>
-    </div>
-  );
-}
+const ROLE_SHORT: Record<string, string> = {
+  lhand: "LH",
+  rhand: "RH",
+  torso: "TO",
+  lleg: "LL",
+  rleg: "RL",
+};
 
 export default function Home() {
   const router = useRouter();
   const [name, setName] = useState("");
   const [code, setCode] = useState("");
-  const [board, setBoard] = useState<Record<string, ScoreRow[]>>({});
-  const [tab, setTab] = useState<SquadSize>(5);
+  const [codeError, setCodeError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [joinError, setJoinError] = useState("");
-  const [leaderboardError, setLeaderboardError] = useState("");
 
   useEffect(() => {
-    const frame = requestAnimationFrame(() => setName(localStorage.getItem("mh_name") ?? ""));
-    return () => cancelAnimationFrame(frame);
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- localStorage is intentionally read after hydration.
+    setName(localStorage.getItem("singularity_name") ?? "");
   }, []);
-
-  useEffect(() => {
-    let active = true;
-    Promise.all(CHALLENGES.map((c) => fetch(`/api/leaderboard?challenge=${c.id}&squad=${tab}&limit=5`).then((r) => { if (!r.ok) throw new Error("Leaderboard unavailable"); return r.json() as Promise<{ rows?: ScoreRow[] }>; }).then((d) => [c.id, d.rows ?? []] as const))).then((entries) => {
-      if (active) setBoard(Object.fromEntries(entries));
-    }).catch(() => {
-      if (active) setLeaderboardError("Best times are temporarily unavailable. Try again in a moment.");
-    });
-    return () => { active = false; };
-  }, [tab]);
 
   const saveName = () => {
     const n = name.trim().slice(0, 16) || `Player${Math.floor(Math.random() * 90 + 10)}`;
-    localStorage.setItem("mh_name", n);
+    localStorage.setItem("singularity_name", n);
     return n;
   };
-  const create = (solo = false) => { saveName(); setJoinError(""); setBusy(true); router.push(`/play/${makeCode()}${solo ? "?solo=1" : ""}`); };
+  const create = (solo = false) => {
+    saveName();
+    setBusy(true);
+    router.push(`/play/${createRoomCode()}${solo ? "?solo=1" : ""}`);
+  };
   const join = () => {
-    const c = code.trim().toUpperCase();
-    if (!ROOM_CODE_PATTERN.test(c)) { setJoinError("Enter the four-character room code shown by your host."); return; }
-    saveName(); setJoinError(""); setBusy(true); router.push(`/play/${c}`);
+    const error = roomCodeError(code);
+    if (error) {
+      setCodeError(error);
+      return;
+    }
+    const c = normalizeRoomCode(code);
+    saveName();
+    setBusy(true);
+    router.push(`/play/${c}`);
   };
 
   return (
-    <main className="landing-page">
-      <div className="landing-noise" aria-hidden="true" />
-      <div className="landing-shell">
-        <nav className="site-nav" aria-label="Main navigation"><a className="brand-mark" href="#top" aria-label="Many Hands home"><span className="brand-mark__glyph" aria-hidden="true"><span /><span /><span /><span /></span><span>MANY HANDS</span></a><div className="site-nav__meta"><span className="nav-live-dot" /> Multiplayer physics / 01</div><a className="site-nav__jump" href="#leaderboard">View times <span aria-hidden="true">↘</span></a></nav>
-        <section id="top" className="hero-grid">
-          <div className="hero-copy"><p className="eyebrow"><span className="eyebrow__line" /> Co-op physics party game</p><h1>One body.<br /><em>Many hands.</em></h1><p className="hero-description">Three or five players share one wobbly body. Coordinate every step, grab, and climb before the water gets you.</p><div className="hero-specs" aria-label="Game features"><span><strong>3 / 5</strong> players</span><span><strong>01</strong> shared body</span><span><strong>∞</strong> shouting</span></div></div>
-          <div className="hero-visual"><GameplayWorld /></div>
-          <section className="action-panel" aria-labelledby="start-heading"><div className="action-panel__header"><div><p className="eyebrow eyebrow--small">Get into the world</p><h2 id="start-heading">Start a session</h2></div><span className="action-panel__index">02</span></div><label className="field-label" htmlFor="player-name">Your name</label><input id="player-name" value={name} onChange={(e) => setName(e.target.value)} maxLength={16} autoComplete="nickname" placeholder="e.g. Left Leg Larry" className="field-input" /><p className="field-hint">16 characters max. A name is generated if you leave this blank.</p><div className="action-grid"><button type="button" disabled={busy} onClick={() => create(false)} className="button button--primary"><span>Create room</span><small>3 or 5 per team</small><span className="button__arrow" aria-hidden="true">↗</span></button><button type="button" disabled={busy} onClick={() => create(true)} className="button button--secondary"><span>Solo practice</span><small>Control every part</small><span className="button__arrow" aria-hidden="true">↗</span></button></div><div className="join-divider"><span>or join an existing room</span></div><form className="join-form" onSubmit={(event) => { event.preventDefault(); join(); }}><label className="sr-only" htmlFor="room-code">Four-character room code</label><input id="room-code" value={code} onChange={(e) => { setCode(e.target.value.toUpperCase().replace(/[^A-HJ-NP-Z2-9]/g, "")); setJoinError(""); }} maxLength={4} inputMode="text" autoComplete="off" placeholder="ROOM CODE" aria-invalid={Boolean(joinError)} aria-describedby={joinError ? "room-code-error" : "room-code-hint"} className="field-input field-input--code" /><button type="submit" disabled={busy} className="button button--join">Join <span aria-hidden="true">↗</span></button></form>{joinError ? <p id="room-code-error" className="form-message form-message--error" role="alert">{joinError}</p> : <p id="room-code-hint" className="field-hint">Ask your host for the code displayed in their lobby.</p>}{busy && <p className="form-message form-message--loading" role="status"><span className="loading-bar" /> Preparing your physics world...</p>}</section>
+    <main className="meet-landing min-h-dvh">
+      <div className="meet-topbar sticky top-0 z-30">
+        <div className="mx-auto flex max-w-6xl items-center gap-3 px-5 py-3">
+          <span className="meet-wordmark font-black">SINGULARITY</span>
+          <span className="hidden rounded-full border border-black/15 px-2.5 py-0.5 text-xs font-black tracking-[0.18em] text-black/60 sm:inline">
+            5 PLAYERS · 1 BODY
+          </span>
+        </div>
+      </div>
+
+      <div className="mx-auto max-w-6xl px-5 pb-16 pt-10 md:pt-14">
+        {/* Hero: offer + entry left, linkage + heats right. Fills the desktop void with real product truth. */}
+        <div className="grid items-start gap-8 lg:grid-cols-[1.02fr_0.98fr]">
+          <div className="min-w-0 max-w-2xl">
+            <h1 className="meet-h1 font-black">
+              FIVE PLAYERS.
+              <br />
+              <span className="meet-accent-text">ONE BODY.</span>
+            </h1>
+            <p className="mt-4 max-w-xl text-lg leading-relaxed text-black/70">
+              Build a 3- or 5-player squad around <span className="font-black text-black">one shared body</span>, then
+              race rival teams. Torso steers and balances, hands grab and carry, legs move in rhythm.
+            </p>
+
+            <section aria-label="Enter the game" className="meet-panel mt-6 rounded-2xl p-5">
+              <label htmlFor="player-name" className="meet-display text-sm tracking-[0.14em] text-black/60">
+                YOUR NAME
+              </label>
+              <input
+                id="player-name"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                maxLength={16}
+                placeholder="e.g. Left Leg Larry"
+                autoComplete="nickname"
+                className="meet-field mt-2 w-full min-w-0 rounded-xl px-4 py-3 text-lg font-bold outline-none"
+              />
+              <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                <button
+                  disabled={busy}
+                  onClick={() => create(false)}
+                  className="meet-cta rounded-2xl px-5 py-4 text-left text-xl font-black disabled:opacity-60"
+                >
+                  Create versus room
+                  <span className="block text-xs font-bold opacity-80">2–6 teams · 3 or 5 players each</span>
+                </button>
+                <button
+                  disabled={busy}
+                  onClick={() => create(true)}
+                  className="meet-ghost-btn rounded-2xl px-5 py-4 text-left text-xl font-black disabled:opacity-60"
+                >
+                  Solo practice
+                  <span className="block text-xs font-bold text-black/55">Control every part (Tab to switch)</span>
+                </button>
+              </div>
+              <div className="mt-5">
+                <label htmlFor="room-code" className="meet-display text-sm tracking-[0.14em] text-black/60">
+                  ROOM CODE
+                </label>
+                <div className="mt-2 flex gap-2">
+                  <input
+                    id="room-code"
+                    value={code}
+                    onChange={(e) => {
+                      setCode(e.target.value.toUpperCase());
+                      if (codeError) setCodeError(null);
+                    }}
+                    onKeyDown={(e) => e.key === "Enter" && join()}
+                    maxLength={8}
+                    autoComplete="off"
+                    autoCapitalize="characters"
+                    spellCheck={false}
+                    aria-invalid={codeError ? true : undefined}
+                    aria-describedby="room-code-error"
+                    placeholder="ROOM CODE"
+                    className="meet-field meet-tabular min-w-0 w-full rounded-xl px-4 py-3 text-lg font-bold tracking-[0.22em] outline-none"
+                  />
+                  <button
+                    disabled={busy}
+                    onClick={join}
+                    className="meet-join shrink-0 rounded-xl px-6 py-3 text-lg font-black disabled:opacity-60"
+                  >
+                    Join
+                  </button>
+                </div>
+                <p id="room-code-error" role={codeError ? "alert" : undefined} className="mt-1 min-h-4 text-xs font-bold text-[#B3261E]">
+                  {codeError}
+                </p>
+              </div>
+            </section>
+
+            <div id="how" className="mt-4 grid scroll-mt-24 gap-3 sm:grid-cols-3">
+              <div className="meet-panel rounded-xl p-4">
+                <div className="meet-tabular text-xs font-bold tracking-[0.14em] text-[#8F2006]">NAME</div>
+                <div className="mt-1 text-sm font-black">Enter name</div>
+                <p className="mt-0.5 text-xs leading-relaxed text-black/55">16 characters, picked once.</p>
+              </div>
+              <div className="meet-panel rounded-xl p-4">
+                <div className="meet-tabular text-xs font-bold tracking-[0.14em] text-[#8F2006]">ENTER</div>
+                <div className="mt-1 text-sm font-black">Create or join</div>
+                <p className="mt-0.5 text-xs leading-relaxed text-black/55">Versus room or solo reps.</p>
+              </div>
+              <div className="meet-panel rounded-xl p-4">
+                <div className="meet-tabular text-xs font-bold tracking-[0.14em] text-[#8F2006]">SYNC</div>
+                <div className="mt-1 text-sm font-black">Pick roles, ready</div>
+                <p className="mt-0.5 text-xs leading-relaxed text-black/55">Leader starts the heat.</p>
+              </div>
+            </div>
+
+            <div className="mt-3 grid gap-3 sm:grid-cols-2">
+              <div className="meet-panel rounded-xl p-4 text-sm leading-relaxed text-black/75">
+                <div className="flex items-center justify-between gap-2">
+                  <h2 className="meet-display text-sm tracking-[0.14em] text-black">WALKING</h2>
+                  <span className="meet-tabular flex items-center gap-1 text-xs font-bold text-black/45" aria-hidden="true">
+                    <span className="inline-block h-1.5 w-1.5 rounded-full bg-[#1E7A3C]" />
+                    <span>L</span>
+                    <span className="text-black/25">·</span>
+                    <span>R</span>
+                    <span className="text-black/25">·</span>
+                    <span>L</span>
+                    <span className="text-black/25">·</span>
+                    <span>R</span>
+                  </span>
+                </div>
+                <p className="mt-1">
+                  5P: left leg presses <kbd className="rounded px-1">W</kbd>, then right leg presses{" "}
+                  <kbd className="rounded px-1">W</kbd>. 3P: legs hold{" "}
+                  <kbd className="rounded px-1">W</kbd> to auto-alternate. Both at once? You fall on your face.
+                </p>
+              </div>
+              <div className="meet-panel rounded-xl p-4 text-sm leading-relaxed text-black/75">
+                <div className="flex items-center justify-between gap-2">
+                  <h2 className="meet-display text-sm tracking-[0.14em] text-black">CARRYING</h2>
+                  <span className="meet-tabular flex items-center gap-1 text-xs font-bold text-black/45" aria-hidden="true">
+                    <span className="inline-block h-1.5 w-3 rounded-full bg-[#1D5FC2]" />
+                    <span className="inline-block h-1.5 w-3 rounded-full bg-[#1D5FC2]" />
+                    <span>GRIP</span>
+                  </span>
+                </div>
+                <p className="mt-1">
+                  5P: BOTH hands hold <kbd className="rounded px-1">Space</kbd> to grab together, both{" "}
+                  <kbd className="rounded px-1">Shift</kbd> to throw. 3P: arms grab alone. Torso{" "}
+                  <kbd className="rounded px-1">Q</kbd> shouts the rhythm.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          {/* Right rail: shared-body diagram + tonight's heats. This is what the blank void was missing. */}
+          <div className="grid min-w-0 gap-4">
+            <div className="meet-linkage rounded-3xl p-5" aria-label="One body, five operators">
+              <div className="flex items-center justify-between gap-2">
+                <h2 className="meet-display text-lg tracking-[0.12em]">ONE BODY · FIVE OPERATORS</h2>
+                <span className="meet-tabular rounded-full border border-black/15 px-2 py-0.5 text-xs font-bold tracking-[0.14em] text-black/55">
+                  SYNC OR FALL
+                </span>
+              </div>
+              <ol className="mt-4 grid grid-cols-5 items-center gap-1 text-center">
+                {ROLES_5.map((r) => (
+                  <li key={r} className="min-w-0">
+                    <span
+                      className="mx-auto grid h-12 w-12 place-items-center rounded-full border-2 border-[#BE2E0D] bg-white text-[#8F2006] md:h-14 md:w-14"
+                      title={ROLE_INFO[r].label}
+                    >
+                      <RoleIcon role={r} className="h-6 w-6 md:h-7 md:w-7" />
+                    </span>
+                    <span className="meet-tabular mt-1.5 block text-xs font-bold tracking-[0.12em] text-black/60">
+                      {ROLE_SHORT[r]}
+                    </span>
+                  </li>
+                ))}
+              </ol>
+              <div className="mt-3 rounded-2xl bg-black/[0.04] px-4 py-3 text-center">
+                <p className="text-sm font-black tracking-wide">THE HUB ONLY MOVES WHEN THE CREW AGREES</p>
+                <p className="mt-0.5 text-xs leading-relaxed text-black/55">
+                  Legs set the rhythm · Torso keeps balance · Hands commit together. Rival squads race beside you as
+                  live ghosts.
+                </p>
+              </div>
+            </div>
+
+            <section id="heats" aria-label="Tonight's heats" className="meet-panel scroll-mt-24 rounded-3xl p-5">
+              <div className="flex flex-wrap items-end justify-between gap-2">
+                <h2 className="meet-display text-2xl tracking-[0.1em]">TONIGHT&apos;S HEATS</h2>
+                <p className="meet-tabular text-xs font-bold tracking-[0.14em] text-black/50">5 EVENTS</p>
+              </div>
+              <ol className="mt-3 grid gap-2">
+                {CHALLENGES.map((c, i) => (
+                  <li key={c.id} className="meet-heat meet-sweep flex items-center gap-3 rounded-2xl px-3 py-2.5" style={{ animationDelay: `${i * 70}ms` }}>
+                    <span className="meet-heat-lane-no meet-tabular w-8 shrink-0 text-center" aria-hidden="true">
+                      {String(i + 1).padStart(2, "0")}
+                    </span>
+                    <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-black/[0.05] text-black/70">
+                      <ChallengeIcon challenge={c} className="h-5 w-5" />
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-sm font-black">
+                        {c.name} <span className={`diff diff-${c.difficulty} ml-1`}>{c.difficulty}</span>
+                      </span>
+                      <span className="block text-xs leading-snug text-black/55 [display:-webkit-box] [-webkit-box-orient:vertical] [-webkit-line-clamp:2] overflow-hidden">{c.tagline}</span>                    </span>
+                  </li>
+                ))}
+              </ol>
+              <p className="mt-3 text-xs leading-relaxed text-black/50">
+                Picked by the room leader in the lobby. Rival teams run the same course head-to-head.
+              </p>
+            </section>
+          </div>
+        </div>
+
+        <section id="crew" aria-label="Crew roles" className="meet-panel mt-10 scroll-mt-24 rounded-3xl p-5">
+          <div className="flex flex-wrap items-end justify-between gap-2">
+            <h2 className="meet-display text-2xl tracking-[0.1em]">PICK YOUR LIMB</h2>
+            <p className="text-xs text-black/55">One joint per player. The line only holds when every joint pulls.</p>
+          </div>
+          <div className="relative mt-4">
+            <div className="absolute left-6 right-6 top-7 hidden h-0.5 bg-black/15 md:block" aria-hidden="true" />
+            <ol className="relative grid gap-3 sm:grid-cols-3 md:grid-cols-5">
+              {ROLES_5.map((r) => (
+                <li key={r} className="meet-joint relative rounded-2xl p-3 text-center">
+                  <span className="mx-auto grid h-14 w-14 place-items-center rounded-full border-2 border-[#BE2E0D] bg-white text-[#8F2006]" aria-hidden="true">
+                    <RoleIcon role={r} className="h-7 w-7" />
+                  </span>
+                  <div className="mt-2 text-sm font-black">{ROLE_INFO[r].label}</div>
+                  <div className="mt-1 text-xs leading-snug text-black/55">{ROLE_INFO[r].blurb}</div>
+                  {ROLE_INFO[r].keys[0] && (
+                    <div className="meet-tabular mt-2 text-xs font-bold tracking-[0.1em] text-black/45">
+                      {ROLE_INFO[r].keys[0].key}
+                    </div>
+                  )}
+                </li>
+              ))}
+            </ol>
+          </div>
         </section>
-        <section className="roles-section" aria-labelledby="roles-heading"><div className="section-heading"><div><p className="eyebrow eyebrow--small">The team anatomy</p><h2 id="roles-heading">Every limb has a job.</h2></div><p>Communication is the control scheme. Pick a role in the lobby, then find your rhythm.</p></div><div className="roles-grid">{ROLES_5.map((r, index) => <div key={r} className="role-card" style={{ "--role-delay": `${(index * 0.14).toFixed(2)}s` } as CSSProperties}><span className="role-card__number">0{index + 1}</span><RoleGlyph role={r} className="role-card__glyph" /><span className="role-card__label">{ROLE_INFO[r].label}</span><span className="role-card__blurb">{ROLE_INFO[r].blurb}</span></div>)}</div></section>
-        <section id="leaderboard" className="leaderboard-section" aria-labelledby="leaderboard-heading"><div className="section-heading section-heading--board"><div><p className="eyebrow eyebrow--small">Records from the water</p><h2 id="leaderboard-heading">Best times</h2></div><div className="board-tabs" role="group" aria-label="Leaderboard squad size">{([3, 5] as SquadSize[]).map((n) => <button type="button" key={n} onClick={() => { setLeaderboardError(""); setTab(n); }} aria-pressed={tab === n} className={tab === n ? "is-active" : ""}>{n}P board</button>)}</div></div>{leaderboardError && <p className="form-message form-message--error board-error" role="status">{leaderboardError}</p>}<div className="leaderboard-grid">{CHALLENGES.map((c) => <article key={c.id} className="challenge-card"><div className="challenge-card__header"><span className="challenge-card__icon" aria-hidden="true">{c.icon}</span><div><h3>{c.name}</h3><p>{c.tagline}</p></div><span className={`difficulty difficulty--${c.difficulty.toLowerCase()}`}>{c.difficulty}</span></div><div className="score-list">{(board[c.id] ?? []).length === 0 ? <div className="empty-score">No times yet. Be the first crew on the board.</div> : (board[c.id] ?? []).map((row, i) => <div key={row.id} className="score-row"><span className="score-row__rank">{String(i + 1).padStart(2, "0")}</span><span className="score-row__team">{row.teamName}</span><span className="score-row__time">{formatTime(row.timeMs)}</span></div>)}</div></article>)}</div></section>
-        <footer className="site-footer"><span>Many Hands / Built with Three.js + Rapier physics</span><span>Best with a keyboard and friends who communicate loudly.</span></footer>
+
+        <footer className="mt-8 flex flex-col items-center gap-2 pb-4 text-center text-xs leading-relaxed text-black/50">
+          <p>
+            Keyboard or mobile touch; rival squads race beside you as live, non-contact ghosts.
+          </p>
+          <p className="meet-tabular text-xs font-bold tracking-[0.18em]">3P · ARMS TORSO LEGS — 5P · HANDS TORSO LEGS</p>
+        </footer>
       </div>
     </main>
   );
